@@ -160,7 +160,7 @@ class SSDOCCHead(BaseModule):
          gt_pts_weights) = multi_apply(self._get_target_single, refine_pts_list, gt_points_list, 
                         gt_masks_list, gt_labels_list, cls_weights_list)
         
-        gt_paired_pts, pred_paired_pts, valid_cls_scores, valid_refine_pts = [], [], [], []
+        gt_paired_pts, pred_paired_pts, valid_cls_scores, valid_refine_pts, valid_labels_list = [], [], [], [], []
         for i in range(batch_size):
             if gt_paired_idx_list[i] == []:
                 continue
@@ -168,21 +168,26 @@ class SSDOCCHead(BaseModule):
             gt_paired_pts.append(refine_pts_list[i][gt_paired_idx_list[i]])
             pred_paired_pts.append(gt_points_list[i][pred_paired_idx_list[i]])
 
+            valid_labels_list.append(labels_list[i])
             valid_cls_scores.append(cls_scores_list[i])
             valid_refine_pts.append(refine_pts_list[i])
-            
             
         # Record Matched Results
         if refine_num == self.last_layer_num_refine:
             last_matched_result = dict(
                 gt_paired_pts=pred_paired_pts,
-                pred_paired_pts=refine_pts,
-                gt_paired_labels=labels_list,
-                pred_paired_labels=[torch.max(cls_scores_i, dim=-1)[1] for cls_scores_i in cls_scores_list]
+                pred_paired_pts=valid_refine_pts,
+                gt_paired_labels=valid_labels_list,
+                pred_paired_labels=[torch.max(cls_scores_i, dim=-1)[1] for cls_scores_i in valid_cls_scores]
             )
-            self.matched_results.update(
-                last_matched_result
-            )
+            if num_classes == self.region_aware_branch.num_classes:
+                self.matched_results['matched_result_r'] = last_matched_result
+            elif num_classes == self.object_aware_branch.num_classes:
+                self.matched_results['matched_result_o'] = last_matched_result
+            else:
+                self.matched_results.update(
+                    last_matched_result
+                )
         
         # concatenate all results from different samples
         cls_scores = torch.cat(valid_cls_scores) # [DT_NUM, C]

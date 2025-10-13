@@ -1,5 +1,5 @@
-from .vis_hook import VisualizationHook, visualize_occ, visualize_results
+from .vis_hook import VisualizationHook, visualize_results
 
 __all__ = [
-    'VisualizationHook', 'visualize_occ', 'visualize_results'
+    'VisualizationHook', 'visualize_results'
 ]

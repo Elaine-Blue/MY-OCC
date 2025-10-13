@@ -209,7 +209,7 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=dataset_root,
-        ann_file=dataset_root + 'nuscenes_infos_train_sweep.pkl',
+        ann_file=dataset_root + 'nuscenes_infos_train_mini_sweep.pkl',
         pipeline=train_pipeline,
         classes=object_names,
         modality=input_modality,
@@ -280,7 +280,7 @@ log_config = dict(
         dict(type='TextLoggerHook', interval=50, reset_flag=True),
         dict(type='MyTensorboardLoggerHook', interval=500, reset_flag=True),
         # dict(type='MEGVIIEMAHook2', init_updates=0, decay=0.999, resume=None),
-        dict(type='VisualizationHook', interval=1)
+        dict(type='VisualizationHook', interval=1000)
     ]
 )
 
