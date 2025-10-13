@@ -23,19 +23,41 @@ occ_names = [
     'vegetation'
 ]
 
-# If point cloud range is changed, the models should also change their point
-# cloud range accordingly
+occ_names_region = [
+    'driveable_surface', 'other_flat', 'sidewalk', 'terrain', 'manmade', 'vegetation'
+]
+
+occ_names_object = [
+    'others', 'barrier', 'bicycle', 'bus', 'car', 'construction_vehicle',
+    'motorcycle', 'pedestrian', 'traffic_cone', 'trailer', 'truck',
+]
+
+target_gt_labels_region = [
+    occ_names.index(class_name) for class_name in occ_names_region
+]
+
+target_gt_labels_object = [
+    occ_names.index(class_name) for class_name in occ_names_object
+]
+
 point_cloud_range = [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]
 voxel_size = [0.4, 0.4, 0.4]
 
 # arch config
 embed_dims = 256
-num_layers = 6
-num_query = 2400
-num_frames = 8
+num_query_region = 2000
+num_query_object = 400
+num_query = num_query_region + num_query_object
+num_refines_region = [1, 16, 32]
+num_refines_object = [1, 2, 4, 8, 16, 32]
+num_layers_region = len(num_refines_region)
+num_layers_object = len(num_refines_object)
+num_frames = 2
 num_levels = 4
+num_levels_region = 2
+num_levels_object = 2
 num_points = 2
-num_refines = [1, 2, 4, 8, 16, 32]
+
 
 img_backbone = dict(
     type='ResNet',
@@ -58,7 +80,7 @@ img_norm_cfg = dict(
     to_rgb=True)
 
 model = dict(
-    type='MYOCC',
+    type='SSDOCC',
     use_grid_mask=False,
     data_aug=dict(
         img_color_aug=True,  # Move some augmentations to GPU
@@ -68,25 +90,53 @@ model = dict(
     img_backbone=img_backbone,
     img_neck=img_neck,
     pts_bbox_head=dict(
-        type='MYOCCHead',
+        type='SSDOCCHead',
+        occ_names=occ_names,
         num_classes=len(occ_names),
-        in_channels=embed_dims,
-        num_query=num_query,
-        pc_range=point_cloud_range,
-        voxel_size=voxel_size,
-        use_priori_points=True,
-        clusters_data_path='./cluster-centers_17-classes_5_clusters.pkl',
-        transformer=dict(
-            type='MYOCCTransformer',
-            embed_dims=embed_dims,
-            num_frames=num_frames,
-            num_points=num_points,
-            num_layers=num_layers,
-            num_levels=num_levels,
-            num_classes=len(occ_names),
-            num_refines=num_refines,
-            scales=[0.5],
-            pc_range=point_cloud_range),
+        branch_loss_weights=[0.3, 0.7, 0.4, 0.6], 
+        region_aware_branch=dict(
+            type='RegionAwareHead',
+            num_classes=len(occ_names_region),
+            in_channels=embed_dims,
+            num_query=num_query_region,
+            pc_range=point_cloud_range,
+            voxel_size=voxel_size,
+            target_classes=target_gt_labels_region,
+            use_priori_points=True,
+            clusters_data_path='./cluster-centers_17-classes_5_clusters.pkl',
+            transformer=dict(
+                type='SSDTransformerDecoder',
+                embed_dims=embed_dims,
+                num_frames=num_frames,
+                num_points=num_points,
+                num_layers=num_layers_region,
+                num_levels=num_levels_region,
+                num_classes=len(occ_names_region),
+                num_refines=num_refines_region,
+                scales=[0.5],
+                pc_range=point_cloud_range)
+        ),
+        object_aware_branch=dict(
+            type='ObjectAwareHead',
+            num_classes=len(occ_names_object),
+            in_channels=embed_dims,
+            num_query=num_query_object,
+            pc_range=point_cloud_range,
+            voxel_size=voxel_size,
+            target_classes=target_gt_labels_object,
+            transformer=dict(
+                type='SSDTransformerDecoder',
+                embed_dims=embed_dims,
+                num_frames=num_frames,
+                num_points=num_points,
+                num_layers=num_layers_object,
+                num_levels=num_levels_object,
+                num_classes=len(occ_names_object),
+                num_refines=num_refines_object,
+                scales=[0.5],
+                pc_range=point_cloud_range)
+            ),
+        # TODO: Rewrite the following two loss to support multiple branches
         loss_cls=dict(
             type='FocalLoss',
             use_sigmoid=True,
@@ -97,7 +147,12 @@ model = dict(
     train_cfg=dict(
         pts=dict(
             cls_weights=[
-                10, 5, 10, 5, 5, 10, 10, 5, 10, 5, 5, 1, 5, 1, 1, 2, 1],
+                10, 5, 10, 5, 5, 10, 10, 5, 10, 5, 5,  1, 5, 1, 1, 2, 1
+            ],
+            cls_weights_object=[
+                10, 5, 10, 5, 5, 10, 10, 5, 10, 5, 5],
+            cls_weights_region=[
+                1, 5, 1, 1, 2, 1]
             )
         ),
     test_cfg=dict(
@@ -120,15 +175,15 @@ ida_aug_conf = {
 train_pipeline = [
     dict(type='LoadMultiViewImageFromFiles', to_float32=False, color_type='color'),
     dict(type='LoadMultiViewImageFromMultiSweeps', sweeps_num=num_frames - 1),
-    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=False),
+    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, ), # with_bbox=True, with_label=True, with_bbox_depth=True
     dict(type='LoadOccFromFile', occ_root=occ_root), 
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='ObjectNameFilter', classes=object_names),
     dict(type='RandomTransformImage', ida_aug_conf=ida_aug_conf, training=True),
     dict(type='DefaultFormatBundle3D', class_names=object_names),
-    dict(type='Collect3D', keys=['img', 'voxel_semantics', 'mask_camera'], meta_keys=(
+    dict(type='Collect3D', keys=['img', 'voxel_semantics', 'mask_camera',], meta_keys=(
         'filename', 'ori_shape', 'img_shape', 'pad_shape', 'ego2occ', 'ego2img', 
-        'ego2lidar', 'img_timestamp', 'scene_name', 'sample_idx'))
+        'ego2lidar', 'img_timestamp', 'scene_name', 'sample_idx')) #  'gt_bboxes', 'gt_labels', 'centers2d', 'depths'
 ]
 
 test_pipeline = [
@@ -150,7 +205,7 @@ test_pipeline = [
 ]
 
 data = dict(
-    workers_per_gpu=4,
+    workers_per_gpu=2,
     train=dict(
         type=dataset_type,
         data_root=dataset_root,
@@ -205,7 +260,7 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3
 )
-total_epochs = 100
+total_epochs = 50
 batch_size = 8
 
 # load pretrained weights
@@ -216,7 +271,7 @@ revise_keys = [('backbone', 'img_backbone')]
 resume_from = None
 
 # checkpointing
-checkpoint_config = dict(interval=1, max_keep_ckpts=1)
+checkpoint_config = dict(interval=1, max_keep_ckpts=total_epochs)
 
 # logging
 log_config = dict(
@@ -224,12 +279,12 @@ log_config = dict(
     hooks=[
         dict(type='TextLoggerHook', interval=50, reset_flag=True),
         dict(type='MyTensorboardLoggerHook', interval=500, reset_flag=True),
-        dict(type='VisualizationHook', interval=1000)
+        # dict(type='MEGVIIEMAHook2', init_updates=0, decay=0.999, resume=None),
+        dict(type='VisualizationHook', interval=1)
     ]
 )
 
 # evaluation
 eval_config = dict(interval=total_epochs)
 
-# other flags
-debug = False
+debug=False

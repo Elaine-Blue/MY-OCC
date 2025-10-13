@@ -50,3 +50,13 @@ submission
 checkpoints
 pretrain
 visualizations
+work_dirs
+clusters_results
+*/.ipynb_checkpoints/
+data_analysis.py
+create_mini_dataset.py
+configs/opus-m_r50_704x256_8f_100e_debug.py
+cluster_centers_3d.png
+cluster-centers_17-classes_5_clusters.pkl
+cluster-centers_17-classes_20_clusters.pkl
+cluster-centers_17-5_classes.pkl
