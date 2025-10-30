@@ -9,82 +9,20 @@ import os.path as osp
 import numpy as np
 from mmcv.runner import HOOKS, Hook
 from mmdet3d_plugin.models.bbox.utils import decode_points
-import torch
-from tools.visualizer import Visualizer
+from tools.visualizer import Visualizer, world_to_voxel 
 
-classname_to_color = {  # RGB.
-    0: (0, 0, 0),  # Black. noise
-    1: (112, 128, 144),  # Slategrey barrier
-    2: (220, 20, 60),  # Crimson bicycle
-    3: (255, 127, 80),  # Orangered bus
-    4: (255, 158, 0),  # Orange car
-    5: (233, 150, 70),  # Darksalmon construction
-    6: (255, 61, 99),  # Red motorcycle
-    7: (0, 0, 230),  # Blue pedestrian
-    8: (47, 79, 79),  # Darkslategrey trafficcone
-    9: (255, 140, 0),  # Darkorange trailer
-    10: (255, 99, 71),  # Tomato truck
-    11: (0, 207, 191),  # nuTonomy green driveable_surface
-    12: (175, 0, 75),  # flat other
-    13: (75, 0, 75),  # sidewalk
-    14: (112, 180, 60),  # terrain
-    15: (222, 184, 135),  # Burlywood mannade
-    16: (0, 175, 0),  # Green vegetation
-    17: (140, 140, 140),  # Green vegetation
-}
-
-occ_names = [
-    'others', 'barrier', 'bicycle', 'bus', 'car', 'construction_vehicle',
-    'motorcycle', 'pedestrian', 'traffic_cone', 'trailer', 'truck',
-    'driveable_surface', 'other_flat', 'sidewalk', 'terrain', 'manmade',
-    'vegetation'
-]
-
-palette = np.array([classname_to_color[i] for i in range(len(classname_to_color))])
-
-
-RESIZE_SAHPE = (1600, 1200)
-H = W = RESIZE_SAHPE[0] * 1.5
-
-def world_to_voxel(
-        points, 
-        voxel_size=[0.4, 0.4, 0.4], 
-        pc_range=[-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]
-    ):
-    points = points.copy()
-    points[..., 0] = np.clip(points[..., 0], pc_range[0], pc_range[3] - voxel_size[0])
-    points[..., 1] = np.clip(points[..., 1], pc_range[1], pc_range[4] - voxel_size[1])
-    points[..., 2] = np.clip(points[..., 2], pc_range[2], pc_range[5] - voxel_size[2])
+def draw_matched_results(vis_tool, matched_results, seq_idx, save_path, max_num_points=500):
+    gt_paired_pts = matched_results['gt_paired_pts'][seq_idx].detach().cpu().numpy()
+    pred_paired_pts = matched_results['pred_paired_pts'][seq_idx].detach().cpu().numpy()
+    gt_paired_labels = matched_results['gt_paired_labels'][seq_idx].detach().cpu().numpy()
+    pred_paired_labels = matched_results['pred_paired_labels'][seq_idx].detach().cpu().numpy()
     
-    points[..., 0] = (points[..., 0] - pc_range[0]) / voxel_size[0]
-    points[..., 1] = (points[..., 1] - pc_range[1]) / voxel_size[1]
-    points[..., 2] = (points[..., 2] - pc_range[2]) / voxel_size[2]
-    
-    return points.astype(np.int32)
+    factor = (len(gt_paired_pts) // max_num_points) + 1
+    img_rgba = vis_tool.draw_matched_results(pred_paired_pts, gt_paired_pts, pred_paired_labels, gt_paired_labels, factor)
+    img_bgr = cv2.cvtColor(img_rgba, cv2.COLOR_RGBA2BGR)
+    cv2.imwrite(save_path, img_bgr)
 
-def draw_matched_results(vis_tool, matched_results_lst, seq_idx, save_path, target_classes_list=[], max_num_points=500):
-    # Draw all matched results on multiple subplots
-    concat_imgs = []
-    
-    for idx, matched_results in enumerate(matched_results_lst):
-        gt_paired_pts = matched_results['gt_paired_pts'][seq_idx].detach().cpu().numpy()
-        pred_paired_pts = matched_results['pred_paired_pts'][seq_idx].detach().cpu().numpy()
-        gt_paired_labels = matched_results['gt_paired_labels'][seq_idx].detach().cpu().numpy()
-        pred_paired_labels = matched_results['pred_paired_labels'][seq_idx].detach().cpu().numpy()
-        
-        # Exists Matched Points is []. Just continue.
-        if len(gt_paired_pts) == 0:
-            continue
-        
-        factor = (len(gt_paired_pts) // max_num_points) + 1
-        img_rgba = vis_tool.draw_matched_results(pred_paired_pts, gt_paired_pts, pred_paired_labels, gt_paired_labels, factor, target_classes_list[idx])
-        img_bgr = cv2.cvtColor(img_rgba, cv2.COLOR_RGBA2BGR)
-        concat_imgs.append(img_bgr)
-
-    save_fig = np.concatenate(concat_imgs, axis=0)
-    cv2.imwrite(save_path, save_fig)
-
-def visualize_results(pc_range, voxel_size, results, matched_results_lst, target_classes_list, data_batch, save_dir, epoch, mode='cube'):
+def visualize_results(pc_range, voxel_size, results, matched_results, data_batch, save_dir, epoch, sample_idx):
     W = int((pc_range[3] - pc_range[0]) / voxel_size[0])
     H = int((pc_range[4] - pc_range[1]) / voxel_size[1])
     Z = int((pc_range[5] - pc_range[2]) / voxel_size[2])
@@ -98,7 +36,10 @@ def visualize_results(pc_range, voxel_size, results, matched_results_lst, target
     
     B = len(data_batch['img_metas'].data[0])
     
-    vis_tool = Visualizer()
+    vis_tool = Visualizer(
+        pc_range=pc_range,
+        voxel_size=voxel_size
+    )
     
     for i in range(B):
         img_metas = data_batch['img_metas'].data[0][i]
@@ -118,7 +59,7 @@ def visualize_results(pc_range, voxel_size, results, matched_results_lst, target
 
         for camera_name, img_path in zip(camera_names, img_paths_fix):
             img = cv2.imread(img_path)
-            img = cv2.resize(img, RESIZE_SAHPE)
+            img = cv2.resize(img, vis_tool.RESIZE_SAHPE)
             cv2.putText(img, camera_name, (0, 20), cv2.FONT_HERSHEY_SIMPLEX,
                         0.6, (255, 255, 255), 2)
             resize_imgs.append(img)
@@ -130,17 +71,18 @@ def visualize_results(pc_range, voxel_size, results, matched_results_lst, target
             init_world_coords = decode_points(init_points[:, :3], pc_range)
             init_points[:, :3] = init_world_coords
         '''
-         
+        
         # 2. Visualize GT Labels
         occ_labels = data_batch['voxel_semantics'][i].cpu().numpy()
-        x, y, z = xx[occ_labels!=17], yy[occ_labels!=17], zz[occ_labels!=17]
-        label = occ_labels[occ_labels!=17].astype(np.int64)
+        mask_camera = data_batch['mask_camera'][i].cpu().numpy()
+        mask_occupied = occ_labels != vis_tool.empty_label
+        mask = mask_camera & mask_occupied
+        x, y, z = xx[mask], yy[mask], zz[mask]
+        label = occ_labels[mask].astype(np.int64)
         gt_sem_image = vis_tool.draw_voxels_3D(
             x, y, z,
             label,
-            palette,
             0.4,
-            pc_range,
         )
         
         # 3. Visualize Pred Labels
@@ -151,9 +93,7 @@ def visualize_results(pc_range, voxel_size, results, matched_results_lst, target
         pred_sem_img = vis_tool.draw_voxels_3D(
             x, y, z,
             label,
-            palette,
             0.4,
-            pc_range
         )
         
         # 4. Concat all images.
@@ -161,26 +101,20 @@ def visualize_results(pc_range, voxel_size, results, matched_results_lst, target
         row_2 = np.hstack([gt_sem_image, pred_sem_img])
         row_3 = np.hstack(resize_imgs[3:])
         concat_img = np.vstack([row_1, row_2, row_3])
-        cv2.imwrite(osp.join(save_dir, f'epoch_{epoch:0>3}_{i:0>6}_{scene_name}_{sample_token}.jpg'), concat_img)
+        cv2.imwrite(osp.join(save_dir, f'{sample_idx:0>6}_epoch_{epoch:0>3}_{i:0>3}_{scene_name}_{sample_token}.jpg'), concat_img)
 
         # Visualize 3D Voxel Pair Matching.
-        if matched_results_lst is not None:
-            save_img_path = osp.join(save_dir, f'epoch_{epoch:0>3}_{i:0>6}_{scene_name}_{sample_token}_matched_pairs.jpg')
-            draw_matched_results(vis_tool, matched_results_lst, i, save_img_path, target_classes_list)  
+        if matched_results:
+            save_img_path = osp.join(save_dir, f'{sample_idx:0>6}_epoch_{epoch:0>3}_{i:0>3}_{scene_name}_{sample_token}_matched_pairs.jpg')
+            draw_matched_results(vis_tool, matched_results, i, save_img_path)  
 
-def post_process(result_list, pc_range, voxel_size, num_classes, target_classes_r, target_classes_o):
+def post_process(result_list, pc_range, voxel_size):
     # Convert all results to numpy.array.
     result_list['init_points'] = result_list['init_points'].detach().cpu().numpy()
-    all_refine_pts_r, all_refine_pts_o = result_list['all_refine_pts_r'], result_list['all_refine_pts_o']
-    refine_pts = torch.cat([all_refine_pts_r[-1], all_refine_pts_o[-1]], dim=1)
-    batch_size, Q, K, _ = refine_pts.shape
-    all_cls_scores_r, all_cls_scores_o = result_list['all_cls_scores_r'], result_list['all_cls_scores_o']
-    cls_scores_r, cls_scores_o = all_cls_scores_r[-1].sigmoid(), all_cls_scores_o[-1].sigmoid()
-    Q1, Q2 = cls_scores_r.shape[1], cls_scores_o.shape[1]
-    cls_scores = torch.zeros((batch_size, Q, K, num_classes), device=refine_pts.device)
-    cls_scores[:, :Q1, :, target_classes_r] = cls_scores_r
-    cls_scores[:, Q1:, :, target_classes_o] = cls_scores_o
-
+    all_refine_pts = result_list['all_refine_pts']
+    refine_pts = all_refine_pts[-1]
+    all_cls_scores = result_list['all_cls_scores']
+    cls_scores = all_cls_scores[-1].sigmoid()
     sem_labels = cls_scores.max(-1)[1].detach().cpu().numpy()
     result_list['sem_pred'] = sem_labels
     
@@ -210,24 +144,14 @@ class VisualizationHook(Hook):
             model = runner.model.module
             result_list = model.intermediate_results['result_list']
             
-            # Get 2-branch dt-voxels & gt-voxels matched results
-            matched_results = model.intermediate_results.get('matched_results', None)
-            matched_results_r = matched_results.get('matched_result_r', None)
-            matched_results_o = matched_results.get('matched_result_o', None)
-            if matched_results_r is not None and matched_results_o is not None:
-                matched_results_lst = [matched_results_r, matched_results_o]
-            else:
-                matched_results_lst = [matched_results]
+            # Get dt-voxels & gt-voxels matched results
+            matched_results = model.intermediate_results.get('matched_results', {})
             
             # Post-process results
             pc_range = model.pts_bbox_head.pc_range.cpu().numpy()
             voxel_size = model.pts_bbox_head.voxel_size.cpu().numpy()
-            num_classes = model.pts_bbox_head.num_classes
-            target_classes_r = model.pts_bbox_head.region_aware_branch.target_classes
-            target_classes_o = model.pts_bbox_head.object_aware_branch.target_classes
-            target_classes_list = [target_classes_r, target_classes_o]
             
-            result_list = post_process(result_list, pc_range, voxel_size, num_classes, target_classes_r, target_classes_o)
+            result_list = post_process(result_list, pc_range, voxel_size)
             
             data_batch = runner.data_batch
             epoch = runner.epoch
@@ -238,10 +162,10 @@ class VisualizationHook(Hook):
                 pc_range,
                 voxel_size,
                 result_list,
-                matched_results_lst,
-                target_classes_list,
+                matched_results,
                 data_batch,
                 save_dir,
-                epoch
+                epoch,
+                self.interval
             )
 

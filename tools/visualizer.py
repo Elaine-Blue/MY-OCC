@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 from PIL import Image, ImageDraw, ImageFont
 import io, os
 import cv2
+import torch
 
 classname_to_color_cv = {  # RGB.
     0: (0, 0, 0),  # Black. noise
@@ -24,14 +25,15 @@ classname_to_color_cv = {  # RGB.
     14: (112, 180, 60),  # terrain
     15: (222, 184, 135),  # Burlywood mannade
     16: (0, 175, 0),  # Green vegetation
-    17: (140, 140, 140),  # Green vegetation
+    17: (230, 230, 230),  # boundary free
+    18: (230, 230, 230), # interior free 
 }
 
 occ_names = [
     'others', 'barrier', 'bicycle', 'bus', 'car', 'construction_vehicle',
     'motorcycle', 'pedestrian', 'traffic_cone', 'trailer', 'truck',
     'driveable_surface', 'other_flat', 'sidewalk', 'terrain', 'manmade',
-    'vegetation'
+    'vegetation', 'free', 'boundary'
 ]
 
 color_map = {
@@ -39,14 +41,80 @@ color_map = {
     for key, color in classname_to_color_cv.items()
 }
 
+def world_to_voxel(
+        points, 
+        voxel_size=[0.4, 0.4, 0.4], 
+        pc_range=[-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]
+    ):
+    points = points.copy()
+    points[..., 0] = np.clip(points[..., 0], pc_range[0], pc_range[3] - voxel_size[0])
+    points[..., 1] = np.clip(points[..., 1], pc_range[1], pc_range[4] - voxel_size[1])
+    points[..., 2] = np.clip(points[..., 2], pc_range[2], pc_range[5] - voxel_size[2])
+    
+    points[..., 0] = (points[..., 0] - pc_range[0]) / voxel_size[0]
+    points[..., 1] = (points[..., 1] - pc_range[1]) / voxel_size[1]
+    points[..., 2] = (points[..., 2] - pc_range[2]) / voxel_size[2]
+    
+    return points.astype(np.int32)
+
+def get_sparse_voxels(
+        voxel_semantics, 
+        mask_camera,
+        pc_range=[-40.0, -40.0, -1.0, 40.0, 40.0, 5.4],
+        scene_size=[80, 80, 6.4],
+        filter_classes=[17]
+    ):
+    '''
+        Args:
+            voxel_semantics: (W, H, Z) tensor / numpy array
+            mask_camera: (W, H, Z) tensor / numpy array
+            filter_classes: list of class indices to filter
+    '''
+    if isinstance(voxel_semantics, np.ndarray):
+        voxel_semantics = torch.from_numpy(voxel_semantics)
+        
+    W, H, Z = voxel_semantics.shape
+    voxel_semantics = voxel_semantics.long()
+    
+    x = torch.arange(0, W, dtype=torch.float32)
+    x = (x + 0.5) / W * scene_size[0] + pc_range[0]
+    y = torch.arange(0, H, dtype=torch.float32)
+    y = (y + 0.5) / H * scene_size[1] + pc_range[1]
+    z = torch.arange(0, Z, dtype=torch.float32)
+    z = (z + 0.5) / Z * scene_size[2] + pc_range[2]
+
+    xx = x[:, None, None].expand(W, H, Z)
+    yy = y[None, :, None].expand(W, H, Z)
+    zz = z[None, None, :].expand(W, H, Z)
+    world_coords = torch.stack([xx, yy, zz], dim=-1) # actual space
+    
+    if filter_classes is not None:
+        mask = ~torch.isin(voxel_semantics, torch.tensor(filter_classes))
+        mask_camera = mask & mask_camera
+    
+    filter_coords = world_coords[mask_camera].cpu().numpy()
+    filter_labels = voxel_semantics[mask_camera].cpu().numpy()
+    return filter_coords, filter_labels
+
 class Visualizer:
     """3D voxel Matched Results Visualizer"""
-    def __init__(self, figsize=(16, 6)):
+    def __init__(self, 
+                 figsize=(16, 6), 
+                 pc_range=[-40.0, -40.0, -1.0, 40.0, 40.0, 5.4],
+                 voxel_size=[0.4, 0.4, 0.4]
+        ):
         self.figsize = figsize
         self.color_map = color_map
         self.class_names = occ_names
-    
-    
+        self.pc_range = pc_range
+        self.voxel_size = voxel_size
+        self.RESIZE_SAHPE = (1600, 1200)
+        self.H = self.RESIZE_SAHPE[0] * 1.5
+        self.W = self.RESIZE_SAHPE[0] * 1.5
+        self.counter = 0
+        self.empty_label = 18  # free space
+        self.palette = np.array([classname_to_color_cv[i] for i in range(len(classname_to_color_cv))])
+
     def create_color_legend(self, SL=20, LW=20, TL=180, font_size=20):
         color_mapping = {name: color for name, color in zip(occ_names, classname_to_color_cv.values())}
         cmap = color_mapping.copy()
@@ -203,34 +271,31 @@ class Visualizer:
         
         return vertices, faces
 
-    def draw_voxels_3D(self, x, y, z, labels, colors, voxel_size, pc_range):
+    def draw_voxels_3D(self, x, y, z, labels, voxel_size):
         """
         Draw Voxels in 3D space using Plotly.
         
         Parameters:
             - x, y, z: (n, ) world coordinates of voxels
             - labels: (n, ) voxel semantic labels
-            - palette: (n, 3) color palette for each semantic label
             - voxel_size: Float
-            - pc_range: List of point cloud range
         """
         
         fig = go.Figure()
         
         # Draw Background Voxels First
-        unique_labels = np.unique(labels)[::-1]
-        
+        unique_labels = list(classname_to_color_cv.keys())[::-1]
+
         for label in unique_labels:
             mask = labels == label
             if not np.any(mask):
                 continue
-                
             x_class = x[mask]
             y_class = y[mask] 
             z_class = z[mask]
             
-            color = colors[int(label)]
-            color_rgba = f'rgba({int(color[2])}, {int(color[1])}, {int(color[0])}, 0.6)'
+            color = self.palette[int(label)]
+            color_rgba = f'rgba({int(color[2])}, {int(color[1])}, {int(color[0])}, 0.7)'
             
             all_vertices = []
             all_faces = []
@@ -289,17 +354,17 @@ class Visualizer:
                 yaxis_title='Y (m)', 
                 zaxis_title='Z (m)',
                 xaxis=dict(
-                    range=[pc_range[0], pc_range[3]],
+                    range=[self.pc_range[0], self.pc_range[3]],
                     backgroundcolor='white',
                     gridcolor='lightgray'
                 ),
                 yaxis=dict(
-                    range=[pc_range[1], pc_range[4]],
+                    range=[self.pc_range[1], self.pc_range[4]],
                     backgroundcolor='white',
                     gridcolor='lightgray'
                 ),
                 zaxis=dict(
-                    range=[pc_range[2], pc_range[5]],
+                    range=[self.pc_range[2], self.pc_range[5]],
                     backgroundcolor='white',
                     gridcolor='lightgray',
                     tickvals=z_ticks,
@@ -341,3 +406,78 @@ class Visualizer:
         img = Image.open(io.BytesIO(img_bytes))
         save_fig = cv2.cvtColor(np.array(img), cv2.COLOR_RGBA2BGR)
         return save_fig
+
+    def draw_gt_voxels_3D(self, voxels, mask_camera, voxel_size=0.4, filter_classes=[17]):
+        """Draw GT Voxels in 3D space using Plotly."""
+        world_coords, labels = get_sparse_voxels(
+            voxels, 
+            mask_camera,
+            filter_classes=filter_classes,
+        )
+        x, y, z = world_coords[:, 0], world_coords[:, 1], world_coords[:, 2]
+        return self.draw_voxels_3D(x, y, z, labels, voxel_size)
+
+
+    def vis_single(self, result, img_metas, save_dir, sample_token):
+        W = int((self.pc_range[3] - self.pc_range[0]) / self.voxel_size[0])
+        H = int((self.pc_range[4] - self.pc_range[1]) / self.voxel_size[1])
+        Z = int((self.pc_range[5] - self.pc_range[2]) / self.voxel_size[2])
+
+        x = (np.arange(0, W) + 0.5) * self.voxel_size[0] + self.pc_range[0]
+        y = (np.arange(0, H) + 0.5) * self.voxel_size[1] + self.pc_range[1]
+        z = (np.arange(0, Z) + 0.5) * self.voxel_size[2] + self.pc_range[2]
+        xx = x[:, None, None].repeat(H, axis=1).repeat(Z, axis=2)
+        yy = y[None, :, None].repeat(W, axis=0).repeat(Z, axis=2)
+        zz = z[None, None, :].repeat(W, axis=0).repeat(H, axis=1)
+        
+        scene_name = img_metas['scene_name']
+        
+        # 1. Visualize Camera Images.
+        img_paths = img_metas['filename'][:6]
+        cam_turn_map = [2, 0, 1, 4, 3, 5]
+        img_paths_fix = [
+            img_paths[idx] for idx in cam_turn_map
+        ]
+        resize_imgs = []
+        camera_names = [
+            'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 
+            'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
+
+        for camera_name, img_path in zip(camera_names, img_paths_fix):
+            img = cv2.imread(img_path)
+            img = cv2.resize(img, self.RESIZE_SAHPE)
+            cv2.putText(img, camera_name, (0, 20), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (255, 255, 255), 2)
+            resize_imgs.append(img)
+        
+        # 2. Visualize GT Labels
+        occ_labels = result['voxel_semantics']
+        mask_camera = result['mask_camera']
+        mask_occupied = occ_labels != self.empty_label
+        mask = mask_camera & mask_occupied
+        x, y, z = xx[mask], yy[mask], zz[mask]
+        label = occ_labels[mask].astype(np.int64)
+        gt_sem_image = self.draw_voxels_3D(
+            x, y, z,
+            label,
+            0.4,
+        )
+        
+        # 3. Visualize Pred Labels
+        label, pos = result['sem_pred'].reshape(-1,), result['occ_loc'].reshape(-1, 3)
+        x = xx[pos[:, 0], pos[:, 1], pos[:, 2]]
+        y = yy[pos[:, 0], pos[:, 1], pos[:, 2]]
+        z = zz[pos[:, 0], pos[:, 1], pos[:, 2]]
+        pred_sem_img = self.draw_voxels_3D(
+            x, y, z,
+            label,
+            0.4,
+        )
+        
+        # 4. Concat all images.
+        row_1 = np.hstack(resize_imgs[:3])
+        row_2 = np.hstack([gt_sem_image, pred_sem_img])
+        row_3 = np.hstack(resize_imgs[3:])
+        concat_img = np.vstack([row_1, row_2, row_3])
+        cv2.imwrite(os.path.join(save_dir, f'{self.counter:0>6}_{scene_name}_{sample_token}.jpg'), concat_img)
+        self.counter += 1

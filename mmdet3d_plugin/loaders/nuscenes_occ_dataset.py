@@ -17,10 +17,11 @@ from .utils import compose_ego2img
 
 @DATASETS.register_module()
 class NuScenesOccDataset(NuScenesDataset):    
-    def __init__(self, *args, **kwargs):
+    def __init__(self, pc_range, *args, **kwargs):
         super().__init__(filter_empty_gt=False, *args, **kwargs)
         self.data_infos = self.load_annotations(self.ann_file)
-    
+        self.pc_range = pc_range
+
     def collect_cam_sweeps(self, index, into_past=150, into_future=0):
         all_sweeps_prev = []
         curr_index = index
@@ -126,7 +127,7 @@ class NuScenesOccDataset(NuScenesDataset):
                 ego2img=ego2img,
                 cam_sweeps={'prev': cam_sweeps_prev, 'next': cam_sweeps_next},
             ))
-
+        
         if not self.test_mode:
             annos = self.get_ann_info(index)
             input_dict['ann_info'] = annos
@@ -229,4 +230,28 @@ class NuScenesOccDataset(NuScenesDataset):
             sample_token = info['token']
             save_path=os.path.join(submission_prefix, '{}.npz'.format(sample_token))
             np.savez_compressed(save_path,occ_pred.astype(np.uint8))
+        print('\nFinished.')
+    
+    def visualize(self, occ_results, vis_dir, **kwargs):
+        from tools.visualizer import Visualizer
+        mmcv.mkdir_or_exist(vis_dir)
+        
+        vis_tool = Visualizer(pc_range=self.pc_range)
+        for index, result in enumerate(tqdm(occ_results)):
+            data_info = self.get_data_info(index)
+            sample_idx = data_info['sample_idx']
+            data = self.__getitem__(index)
+            img_metas = data['img_metas'][0].data
+            voxel_semantics = data['voxel_semantics'][0]
+            mask_camera = data['mask_camera'][0]
+            result.update(
+                voxel_semantics=voxel_semantics,
+                mask_camera=mask_camera
+            )
+            vis_tool.vis_single(
+                result,
+                img_metas,
+                vis_dir,
+                sample_idx
+            )
         print('\nFinished.')

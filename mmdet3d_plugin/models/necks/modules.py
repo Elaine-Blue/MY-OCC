@@ -5,139 +5,12 @@ import torch.nn.functional as F
 from mmcv.runner import BaseModule, ModuleList
 from mmcv.cnn import bias_init_with_prob, Scale
 from mmcv.cnn.bricks.transformer import MultiheadAttention, FFN
-from mmcv.ops import knn
-from mmdet.models.utils.builder import TRANSFORMER
-from .bbox.utils import decode_bbox, decode_points, encode_points
-from .utils import inverse_sigmoid, DUMP
-from .occ_sampling import sampling_4d
-from .checkpoint import checkpoint as cp
-from .csrc.wrapper import MSMV_CUDA
-
-
-@TRANSFORMER.register_module()
-class MYOCCTransformer(BaseModule):
-    def __init__(self,
-                 embed_dims,
-                 num_frames=8,
-                 num_views=6,
-                 num_points=4,
-                 num_layers=6,
-                 num_levels=4,
-                 num_classes=10,
-                 num_groups=4,
-                 num_refines=[1, 2, 4, 8, 16, 32],
-                 scales=[1.0],
-                 pc_range=[],
-                 init_cfg=None):
-        assert init_cfg is None, 'To prevent abnormal initialization ' \
-                            'behavior, init_cfg is not allowed to be set'
-        super().__init__(init_cfg=init_cfg)
-
-        self.embed_dims = embed_dims
-        self.pc_range = pc_range
-        self.num_refines = num_refines
-
-        self.decoder = OPUSTransformerDecoder(
-            embed_dims, num_frames, num_views, num_points, num_layers, num_levels,
-            num_classes, num_refines, num_groups, scales, pc_range=pc_range)
-
-    @torch.no_grad()
-    def init_weights(self):
-        self.decoder.init_weights()
-
-    def forward(self, query_points, query_feat, mlvl_feats, img_metas):
-        cls_scores, refine_pts = self.decoder(
-            query_points, query_feat, mlvl_feats, img_metas)
-
-        cls_scores = [torch.nan_to_num(score) for score in cls_scores]
-        refine_pts = [torch.nan_to_num(pts) for pts in refine_pts]
-
-        return cls_scores, refine_pts
-
-
-class OPUSTransformerDecoder(BaseModule):
-    def __init__(self,
-                 embed_dims,
-                 num_frames=8,
-                 num_views=6,
-                 num_points=4,
-                 num_layers=6,
-                 num_levels=4,
-                 num_classes=10,
-                 num_refines=16,
-                 num_groups=4,
-                 scales=[1.0],
-                 pc_range=[],
-                 init_cfg=None):
-        super().__init__(init_cfg)
-        self.num_layers = num_layers
-        self.pc_range = pc_range
-        self.num_frames = num_frames
-        self.num_views = num_views
-        self.num_groups = num_groups
-
-        if len(scales) == 1:
-            scales = scales * num_layers
-        if not isinstance(num_refines, list):
-            num_refines = [num_refines]
-        if len(num_refines) == 1:
-            num_refines = num_refines * num_layers
-        last_refines = [1] + num_refines
-
-        # params are shared across all decoder layers
-        self.decoder_layers = ModuleList()
-        for i in range(num_layers):
-            self.decoder_layers.append(
-                OPUSTransformerDecoderLayer(
-                    embed_dims, num_frames, num_views, num_points, num_levels, num_classes, 
-                    num_groups, num_refines[i], last_refines[i], layer_idx=i, 
-                    scale=scales[i], pc_range=pc_range)
-            )
-
-    @torch.no_grad()
-    def init_weights(self):
-        self.decoder_layers.init_weights()
-
-    def forward(self, query_points, query_feat, mlvl_feats, img_metas):
-        cls_scores, refine_pts = [], []
-
-        ego2img = np.asarray([m['ego2img'] for m in img_metas]).astype(np.float32)
-        ego2img = query_feat.new_tensor(ego2img) # [B, N, 4, 4]
-        ego2occ = np.asarray([m['ego2occ'] for m in img_metas]).astype(np.float32)
-        occ2ego = torch.inverse(query_feat.new_tensor(ego2occ))
-        occ2ego = occ2ego[:, None].expand_as(ego2img)
-        occ2img = ego2img @ occ2ego
-
-        # group image features in advance for sampling, see `sampling_4d` for more details
-        for lvl, feat in enumerate(mlvl_feats):
-            B, TN, GC, H, W = feat.shape  # [B, TN, GC, H, W]
-            N, T, G, C = self.num_views, self.num_frames, self.num_groups, GC//self.num_groups
-            assert T*N == TN
-            feat = feat.reshape(B, T, N, G, C, H, W)
-
-            if MSMV_CUDA:  # Our CUDA operator requires channel_last
-                feat = feat.permute(0, 1, 3, 2, 5, 6, 4)  # [B, T, G, N, H, W, C]
-                feat = feat.reshape(B*T*G, N, H, W, C)
-            else:  # Torch's grid_sample requires channel_first
-                feat = feat.permute(0, 1, 3, 4, 2, 5, 6)  # [B, T, G, C, N, H, W]
-                feat = feat.reshape(B*T*G, C, N, H, W)
-
-            mlvl_feats[lvl] = feat.contiguous()
-
-        for i, decoder_layer in enumerate(self.decoder_layers):
-            DUMP.stage_count = i
-
-            query_points = query_points.detach()
-            query_feat, cls_score, query_points = decoder_layer(
-                query_points, query_feat, mlvl_feats, occ2img, img_metas)
-
-            cls_scores.append(cls_score)
-            refine_pts.append(query_points)
-
-        return cls_scores, refine_pts
-
-
-class OPUSTransformerDecoderLayer(BaseModule):
+from ..bbox.utils import decode_bbox, decode_points, encode_points
+from ..occ_sampling import sampling_4d
+from ..checkpoint import checkpoint as cp
+from ..utils import inverse_sigmoid, DUMP
+    
+class TransformerDecoderLayer(BaseModule):
     def __init__(self,
                  embed_dims,
                  num_frames=8,
@@ -174,9 +47,9 @@ class OPUSTransformerDecoderLayer(BaseModule):
             nn.ReLU(inplace=True),
         )
 
-        self.self_attn = OPUSSelfAttention(
+        self.self_attn = SelfAttention(
             embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
-        self.sampling = OPUSSampling(embed_dims, num_frames=num_frames, num_views=num_views,
+        self.sampling = Sampling(embed_dims, num_frames=num_frames, num_views=num_views,
                                      num_groups=num_groups, num_points=num_points, 
                                      num_levels=num_levels, pc_range=pc_range)
         self.mixing = AdaptiveMixing(in_dim=embed_dims, in_points=num_points * num_frames,
@@ -203,6 +76,16 @@ class OPUSTransformerDecoderLayer(BaseModule):
         reg_branch.append(nn.Linear(self.embed_dims, 3 * self.num_refines))
         self.reg_branch = nn.Sequential(*reg_branch)
 
+        # Add Boundry Classification Branch
+        boundary_branch = []
+        for _ in range(num_cls_fcs):
+            boundary_branch.append(nn.Linear(self.embed_dims, self.embed_dims))
+            boundary_branch.append(nn.LayerNorm(self.embed_dims))
+            boundary_branch.append(nn.ReLU(inplace=True))
+        boundary_branch.append(nn.Linear(
+            self.embed_dims, 2 * self.num_refines))
+        self.boundary_branch = nn.Sequential(*boundary_branch)
+    
     @torch.no_grad()
     def init_weights(self):
         self.self_attn.init_weights()
@@ -211,6 +94,7 @@ class OPUSTransformerDecoderLayer(BaseModule):
 
         bias_init = bias_init_with_prob(0.01)
         nn.init.constant_(self.cls_branch[-1].bias, bias_init)
+        nn.init.constant_(self.boundary_branch[-1].bias, bias_init)
 
     def refine_points(self, points_proposal, points_delta):
         B, Q = points_delta.shape[:2]
@@ -227,9 +111,9 @@ class OPUSTransformerDecoderLayer(BaseModule):
         """
         query_pos = self.position_encoder(query_points.flatten(2, 3))
         query_feat = query_feat + query_pos
-
+        
         sampled_feat = self.sampling(
-            query_points, query_feat, mlvl_feats, occ2img, img_metas)
+            query_points, query_feat, mlvl_feats, occ2img, img_metas) #[B, Q, G, FP, C]
         query_feat = self.norm1(self.mixing(sampled_feat, query_feat))
         query_feat = self.norm2(self.self_attn(query_points, query_feat))
         query_feat = self.norm3(self.ffn(query_feat))
@@ -239,14 +123,11 @@ class OPUSTransformerDecoderLayer(BaseModule):
         reg_offset = self.scale * self.reg_branch(query_feat)  # [B, Q, P * 3]
         cls_score = cls_score.reshape(B, Q, self.num_refines, self.num_classes)
         refine_pt = self.refine_points(query_points, reg_offset)
-
-        if DUMP.enabled:
-            pass # TODO: enable OTR dump
-
-        return query_feat, cls_score, refine_pt
+        boundary_score = self.boundary_branch(query_feat)
+        return query_feat, cls_score, boundary_score, refine_pt
 
 
-class OPUSSelfAttention(BaseModule):
+class SelfAttention(BaseModule):
     """Scale-adaptive Self Attention"""
     def __init__(self, 
                  embed_dims=256,
@@ -297,7 +178,7 @@ class OPUSSelfAttention(BaseModule):
         return -dist
 
 
-class OPUSSampling(BaseModule):
+class Sampling(BaseModule):
     """Adaptive Spatio-temporal Sampling"""
     def __init__(self,
                  embed_dims=256,

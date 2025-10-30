@@ -8,8 +8,6 @@ from mmdet.models import HEADS
 from mmdet.models import builder
 from mmdet.models.builder import build_loss
 from .bbox.utils import decode_points
-import pickle
-import copy
 
 @HEADS.register_module()
 class SSDOCCHead(BaseModule):
@@ -68,10 +66,9 @@ class SSDOCCHead(BaseModule):
         self.object_aware_branch.init_weights()
 
     def forward(self, mlvl_feats, img_metas):
-        mlvl_feats_r = [mlvl_feats[0], mlvl_feats[2]]
-        mlvl_feats_o = [mlvl_feats[1], mlvl_feats[3]]
         result_dict = {}
-        
+        mlvl_feats_r = [mlvl_feat.clone() for mlvl_feat in mlvl_feats]
+        mlvl_feats_o = [mlvl_feat.clone() for mlvl_feat in mlvl_feats]
         init_points_r, cls_scores_r, refine_pts_r = self.region_aware_branch(mlvl_feats_r, img_metas)
         init_points_o, cls_scores_o, refine_pts_o = self.object_aware_branch(mlvl_feats_o, img_metas)
         
