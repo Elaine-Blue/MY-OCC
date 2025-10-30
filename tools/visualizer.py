@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 from PIL import Image, ImageDraw, ImageFont
 import io, os
 import cv2
+import torch
 
 classname_to_color_cv = {  # RGB.
     0: (0, 0, 0),  # Black. noise
@@ -25,6 +26,7 @@ classname_to_color_cv = {  # RGB.
     15: (222, 184, 135),  # Burlywood mannade
     16: (0, 175, 0),  # Green vegetation
     17: (140, 140, 140),  # Green vegetation
+    18: (0, 255, 255) # init points
 }
 
 occ_names = [
@@ -38,6 +40,61 @@ color_map = {
     key: (color[2]/255.0, color[1]/255.0, color[0]/255.0)
     for key, color in classname_to_color_cv.items()
 }
+
+def world_to_voxel(
+        points, 
+        voxel_size=[0.4, 0.4, 0.4], 
+        pc_range=[-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]
+    ):
+    points = points.copy()
+    points[..., 0] = np.clip(points[..., 0], pc_range[0], pc_range[3] - voxel_size[0])
+    points[..., 1] = np.clip(points[..., 1], pc_range[1], pc_range[4] - voxel_size[1])
+    points[..., 2] = np.clip(points[..., 2], pc_range[2], pc_range[5] - voxel_size[2])
+    
+    points[..., 0] = (points[..., 0] - pc_range[0]) / voxel_size[0]
+    points[..., 1] = (points[..., 1] - pc_range[1]) / voxel_size[1]
+    points[..., 2] = (points[..., 2] - pc_range[2]) / voxel_size[2]
+    
+    return points.astype(np.int32)
+
+def get_sparse_voxels(
+        voxel_semantics, 
+        mask_camera, 
+        pc_range=[-40.0, -40.0, -1.0, 40.0, 40.0, 5.4],
+        scene_size=[80, 80, 6.4],
+        filter_classes=[17]
+    ):
+    '''
+        Args:
+            voxel_semantics: (W, H, Z) tensor / numpy array
+            mask_camera: (W, H, Z) tensor / numpy array
+            filter_classes: list of class indices to filter
+    '''
+    if isinstance(voxel_semantics, np.ndarray):
+        voxel_semantics = torch.from_numpy(voxel_semantics)
+        
+    W, H, Z = voxel_semantics.shape
+    voxel_semantics = voxel_semantics.long()
+    
+    x = torch.arange(0, W, dtype=torch.float32)
+    x = (x + 0.5) / W * scene_size[0] + pc_range[0]
+    y = torch.arange(0, H, dtype=torch.float32)
+    y = (y + 0.5) / H * scene_size[1] + pc_range[1]
+    z = torch.arange(0, Z, dtype=torch.float32)
+    z = (z + 0.5) / Z * scene_size[2] + pc_range[2]
+
+    xx = x[:, None, None].expand(W, H, Z)
+    yy = y[None, :, None].expand(W, H, Z)
+    zz = z[None, None, :].expand(W, H, Z)
+    world_coords = torch.stack([xx, yy, zz], dim=-1) # actual space
+    
+    if filter_classes is not None:
+        mask = ~torch.isin(voxel_semantics, torch.tensor(filter_classes))
+        mask_camera = mask & mask_camera
+    
+    filter_coords = world_coords[mask_camera].cpu().numpy()
+    filter_labels = voxel_semantics[mask_camera].cpu().numpy()
+    return filter_coords, filter_labels
 
 class Visualizer:
     """3D voxel Matched Results Visualizer"""
@@ -224,7 +281,6 @@ class Visualizer:
             mask = labels == label
             if not np.any(mask):
                 continue
-                
             x_class = x[mask]
             y_class = y[mask] 
             z_class = z[mask]
@@ -341,3 +397,12 @@ class Visualizer:
         img = Image.open(io.BytesIO(img_bytes))
         save_fig = cv2.cvtColor(np.array(img), cv2.COLOR_RGBA2BGR)
         return save_fig
+
+    def draw_gt_voxels_3D(self, voxels, mask_camera, pc_range=[], voxel_size=0.4):
+        """Draw GT Voxels in 3D space using Plotly."""
+        world_coords, labels = get_sparse_voxels(
+            voxels, 
+            mask_camera
+        )
+        x, y, z = world_coords[:, 0], world_coords[:, 1], world_coords[:, 2]
+        return self.draw_voxels_3D(x, y, z, labels, classname_to_color_cv, voxel_size, pc_range)
