@@ -98,10 +98,23 @@ def get_sparse_voxels(
 
 class Visualizer:
     """3D voxel Matched Results Visualizer"""
-    def __init__(self, figsize=(16, 6)):
+    def __init__(self, 
+                 figsize=(16, 6), 
+                 pc_range=[-40.0, -40.0, -1.0, 40.0, 40.0, 5.4],
+                 voxel_size=[0.4, 0.4, 0.4]
+        ):
         self.figsize = figsize
         self.color_map = color_map
         self.class_names = occ_names
+        self.pc_range = pc_range
+        self.voxel_size = voxel_size
+        self.RESIZE_SAHPE = (1600, 1200)
+        self.H = self.RESIZE_SAHPE[0] * 1.5
+        self.W = self.RESIZE_SAHPE[0] * 1.5
+        self.counter = 0
+        self.empty_label = 17  # free space
+        self.palette = np.array([classname_to_color_cv[i] for i in range(len(classname_to_color_cv))])
+
     
     
     def create_color_legend(self, SL=20, LW=20, TL=180, font_size=20):
@@ -406,3 +419,67 @@ class Visualizer:
         )
         x, y, z = world_coords[:, 0], world_coords[:, 1], world_coords[:, 2]
         return self.draw_voxels_3D(x, y, z, labels, classname_to_color_cv, voxel_size, pc_range)
+
+    def vis_single(self, result, img_metas, save_dir, sample_token):
+        W = int((self.pc_range[3] - self.pc_range[0]) / self.voxel_size[0])
+        H = int((self.pc_range[4] - self.pc_range[1]) / self.voxel_size[1])
+        Z = int((self.pc_range[5] - self.pc_range[2]) / self.voxel_size[2])
+
+        x = (np.arange(0, W) + 0.5) * self.voxel_size[0] + self.pc_range[0]
+        y = (np.arange(0, H) + 0.5) * self.voxel_size[1] + self.pc_range[1]
+        z = (np.arange(0, Z) + 0.5) * self.voxel_size[2] + self.pc_range[2]
+        xx = x[:, None, None].repeat(H, axis=1).repeat(Z, axis=2)
+        yy = y[None, :, None].repeat(W, axis=0).repeat(Z, axis=2)
+        zz = z[None, None, :].repeat(W, axis=0).repeat(H, axis=1)
+        
+        scene_name = img_metas['scene_name']
+        
+        # 1. Visualize Camera Images.
+        img_paths = img_metas['filename'][:6]
+        cam_turn_map = [2, 0, 1, 4, 3, 5]
+        img_paths_fix = [
+            img_paths[idx] for idx in cam_turn_map
+        ]
+        resize_imgs = []
+        camera_names = [
+            'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 
+            'CAM_BACK_LEFT', 'CAM_BACK', 'CAM_BACK_RIGHT']
+
+        for camera_name, img_path in zip(camera_names, img_paths_fix):
+            img = cv2.imread(img_path)
+            img = cv2.resize(img, self.RESIZE_SAHPE)
+            cv2.putText(img, camera_name, (0, 20), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (255, 255, 255), 2)
+            resize_imgs.append(img)
+        
+        # 2. Visualize GT Labels
+        occ_labels = result['voxel_semantics']
+        mask_camera = result['mask_camera']
+        mask_occupied = occ_labels != self.empty_label
+        mask = mask_camera & mask_occupied
+        x, y, z = xx[mask], yy[mask], zz[mask]
+        label = occ_labels[mask].astype(np.int64)
+        gt_sem_image = self.draw_voxels_3D(
+            x, y, z,
+            label,
+            0.4,
+        )
+        
+        # 3. Visualize Pred Labels
+        label, pos = result['sem_pred'].reshape(-1,), result['occ_loc'].reshape(-1, 3)
+        x = xx[pos[:, 0], pos[:, 1], pos[:, 2]]
+        y = yy[pos[:, 0], pos[:, 1], pos[:, 2]]
+        z = zz[pos[:, 0], pos[:, 1], pos[:, 2]]
+        pred_sem_img = self.draw_voxels_3D(
+            x, y, z,
+            label,
+            0.4,
+        )
+        
+        # 4. Concat all images.
+        row_1 = np.hstack(resize_imgs[:3])
+        row_2 = np.hstack([gt_sem_image, pred_sem_img])
+        row_3 = np.hstack(resize_imgs[3:])
+        concat_img = np.vstack([row_1, row_2, row_3])
+        cv2.imwrite(os.path.join(save_dir, f'{self.counter:0>6}_{scene_name}_{sample_token}.jpg'), concat_img)
+        self.counter += 1

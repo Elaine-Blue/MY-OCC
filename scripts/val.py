@@ -32,6 +32,8 @@ def main():
     parser.add_argument('--local_rank', type=int, default=0)
     parser.add_argument('--world_size', type=int, default=1)
     parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--vis', action='store_true', help='whether to visualize results')
+
     args = parser.parse_args()
 
     # parse configs
@@ -113,6 +115,11 @@ def main():
 
     if local_rank == 0:
         evaluate(val_dataset, results, -1)
+    
+    if args.vis:
+        work_dir = '/'.join(args.weights.split('/')[:-1])
+        vis_dir = os.path.join(work_dir, 'val_mini_visualization')
+        val_dataset.visualize(results, vis_dir)
 
 
 if __name__ == '__main__':

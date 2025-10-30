@@ -207,24 +207,26 @@ class SSDOCCV1(MVXTwoStageDetector):
                 raise TypeError('{} must be a list, but got {}'.format(
                     name, type(var)))
         img = [img] if img is None else img
-        return self.simple_test(img_metas[0], img[0], **kwargs)
+        gt_bboxes_3d, gt_labels_3d = kwargs['gt_bboxes_3d'][0], kwargs['gt_labels_3d'][0]
+        rescale = kwargs.get('rescale', False)
+        return self.simple_test(img_metas[0], img[0], rescale, gt_bboxes_3d, gt_labels_3d)
 
-    def simple_test_pts(self, x, img_metas, rescale=False):
-        outs = self.pts_bbox_head(x, img_metas)
+    def simple_test_pts(self, x, img_metas, rescale=False, gt_bboxes_3d=None, gt_labels_3d=None):
+        outs = self.pts_bbox_head(x, img_metas, gt_bboxes_3d=gt_bboxes_3d, gt_labels_3d=gt_labels_3d)
         return self.pts_bbox_head.get_occ(outs, img_metas[0], rescale=rescale)
-    
-    def simple_test(self, img_metas, img=None, rescale=False, **kwargs):
+
+    def simple_test(self, img_metas, img=None, rescale=False, gt_bboxes_3d=None, gt_labels_3d=None):
         world_size = get_dist_info()[1]
         if world_size == 1:  # online
-            return self.simple_test_online(img_metas, img, rescale)
+            return self.simple_test_online(img_metas, img, rescale, gt_bboxes_3d, gt_labels_3d)
         else:  # offline
-            return self.simple_test_offline(img_metas, img, rescale)
+            return self.simple_test_offline(img_metas, img, rescale, gt_bboxes_3d, gt_labels_3d)
 
-    def simple_test_offline(self, img_metas, img=None, rescale=False):
+    def simple_test_offline(self, img_metas, img=None, rescale=False, gt_bboxes_3d=None, gt_labels_3d=None):
         img_feats = self.extract_feat(img=img, img_metas=img_metas)
-        return self.simple_test_pts(img_feats, img_metas, rescale=rescale)
+        return self.simple_test_pts(img_feats, img_metas, rescale, gt_bboxes_3d, gt_labels_3d)
 
-    def simple_test_online(self, img_metas, img=None, rescale=False):
+    def simple_test_online(self, img_metas, img=None, rescale=False, gt_bboxes_3d=None, gt_labels_3d=None):
         self.fp16_enabled = False
         assert len(img_metas) == 1  # batch_size = 1
 
@@ -288,4 +290,4 @@ class SSDOCCV1(MVXTwoStageDetector):
         img_feats = cast_tensor_type(img_feats, torch.half, torch.float32)
 
         # run occupancy predictor
-        return self.simple_test_pts(img_feats, img_metas, rescale=rescale)
+        return self.simple_test_pts(img_feats, img_metas, rescale, gt_bboxes_3d, gt_labels_3d)

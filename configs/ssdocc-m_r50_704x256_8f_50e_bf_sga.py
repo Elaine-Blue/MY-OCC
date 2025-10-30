@@ -137,8 +137,11 @@ train_pipeline = [
 test_pipeline = [
     dict(type='LoadMultiViewImageFromFiles', to_float32=False, color_type='color'),
     dict(type='LoadMultiViewImageFromMultiSweeps', sweeps_num=num_frames - 1, test_mode=True),
+    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=False),
     dict(type='RandomTransformImage', ida_aug_conf=ida_aug_conf, training=False),
     dict(type='LoadOccFromFile', occ_root=occ_root), 
+    dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='ObjectNameFilter', classes=object_names),
     dict(
         type='MultiScaleFlipAug3D',
         img_scale=(1600, 900),
@@ -146,7 +149,7 @@ test_pipeline = [
         flip=False,
         transforms=[
             dict(type='DefaultFormatBundle3D', class_names=object_names, with_label=False),
-            dict(type='Collect3D', keys=['img', 'voxel_semantics', 'mask_camera'], meta_keys=(
+            dict(type='Collect3D', keys=['img', 'voxel_semantics', 'mask_camera', 'gt_bboxes_3d', 'gt_labels_3d'], meta_keys=(
                 'filename', 'box_type_3d', 'ori_shape', 'img_shape', 'pad_shape',
                 'ego2occ', 'ego2img', 'ego2lidar', 'img_timestamp', 'scene_name', 'sample_idx'))
         ])
@@ -157,6 +160,7 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=dataset_root,
+        pc_range=point_cloud_range,
         ann_file=dataset_root + 'nuscenes_infos_train_sweep.pkl',
         pipeline=train_pipeline,
         classes=object_names,
@@ -167,15 +171,17 @@ data = dict(
     val=dict(
         type=dataset_type,
         data_root=dataset_root,
+        pc_range=point_cloud_range,
         ann_file=dataset_root + 'nuscenes_infos_val_sweep.pkl',
         pipeline=test_pipeline,
         classes=object_names,
         modality=input_modality,
-        test_mode=True,
+        test_mode=False,
         box_type_3d='LiDAR'),
     test=dict(
         type=dataset_type,
         data_root=dataset_root,
+        pc_range=point_cloud_range,
         ann_file=dataset_root + 'nuscenes_infos_test_sweep.pkl',
         pipeline=test_pipeline,
         classes=object_names,
@@ -219,7 +225,7 @@ revise_keys = [('backbone', 'img_backbone')]
 resume_from = None
 
 # checkpointing
-checkpoint_config = dict(interval=1, max_keep_ckpts=1)
+checkpoint_config = dict(interval=1, max_keep_ckpts=total_epochs)
 
 # logging
 log_config = dict(
