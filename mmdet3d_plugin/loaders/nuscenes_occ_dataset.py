@@ -17,9 +17,9 @@ from .utils import compose_ego2img
 
 @DATASETS.register_module()
 class NuScenesOccDataset(NuScenesDataset):    
-    def __init__(self, pc_range, *args, **kwargs):
+    def __init__(self, pc_range, interval=1, *args, **kwargs):
         super().__init__(filter_empty_gt=False, *args, **kwargs)
-        self.data_infos = self.load_annotations(self.ann_file)
+        self.data_infos = self.load_annotations(self.ann_file)[::interval]
         self.pc_range = pc_range
 
     def collect_cam_sweeps(self, index, into_past=150, into_future=0):

@@ -1,12 +1,18 @@
 import os
+import sys
+path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, path)
+
+import os
 import cv2
 import argparse
 import importlib
 import os.path as osp
-import mayavi.mlab as mlab
+from tools.mayaviOffScreen import mlab
 import torch
 import torch.backends.cudnn as cudnn
 import numpy as np
+import matplotlib as mpl
 from datetime import datetime
 from mmcv import Config, DictAction
 from mmcv.parallel import MMDataParallel
@@ -14,8 +20,8 @@ from mmcv.runner import load_checkpoint
 from mmdet.apis import set_random_seed
 from mmdet3d.datasets import build_dataset
 from mmdet3d.models import build_model
-from mmdet3d_plugin.loaders.builder import build_dataloader
-
+from loaders.builder import build_dataloader
+import tqdm
 
 classname_to_color = {  # RGB.
     0: (0, 0, 0),  # Black. noise
@@ -52,7 +58,7 @@ def visualize_occ(x, y, z, labels, palette, voxel_size, classes, mode='cube', co
     if palette.shape[1] == 3:
         palette = np.concatenate([palette, np.ones((palette.shape[0], 1)) * 255], axis=1)
     fig = mlab.figure(size=(1000, 1000), bgcolor=(1, 1, 1))
-    
+
     plot = mlab.points3d(x, y, z,
                          labels,
                          color=color,
@@ -64,6 +70,18 @@ def visualize_occ(x, y, z, labels, palette, voxel_size, classes, mode='cube', co
                          vmax=len(classes)-1)
     plot.module_manager.scalar_lut_manager.lut.table = palette
     
+    # Disable interpolation to get exact palette colors
+    plot.actor.property.interpolation = 'flat'
+    plot.actor.mapper.interpolate_scalars_before_mapping = False
+
+    # Add colorbar/legend
+    mlab.scalarbar(plot, title='Classes', orientation='vertical', nb_labels=len(classes))
+
+    # Optional: Add custom text labels for class names
+    # You can customize the label positions
+    lut = plot.module_manager.scalar_lut_manager.lut
+    lut.number_of_colors = len(classes)
+    
     f = mlab.gcf()
     f.scene._lift()
 
@@ -71,6 +89,7 @@ def visualize_occ(x, y, z, labels, palette, voxel_size, classes, mode='cube', co
         mlab.show()
     else:
         save_fig = mlab.screenshot()
+        print("Save Figure Shape: ", save_fig.shape, "Dtype: ", save_fig.dtype)
         mlab.close()
         return save_fig
 
@@ -197,6 +216,7 @@ if __name__ == '__main__':
                     list(classname_to_color.keys()),
                     show=False)
                 cv2.imwrite(osp.join(work_dir, f'{i:0>6}_result.jpg'), img[..., ::-1])
+                breakpoint()
             else:
                 img, img_metas = data['img'][0].data[0], data['img_metas'][0].data[0]
                 _model = model.module
@@ -217,4 +237,4 @@ if __name__ == '__main__':
                     0.4,
                     list(classname_to_color.keys()),
                     show=False)
-                cv2.imwrite(osp.join(work_dir, f'{i:0>6}_result.jpg'), img[..., ::-1])
+                cv2.imwrite(osp.join(work_dir, f'{i:0>6}_result.jpg'), img[:, :, ::-1])
