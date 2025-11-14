@@ -102,7 +102,7 @@ class Metric_mIoU():
         )
 
     def per_class_iu(self, hist):
-        #return np.diag(hist) / (hist.sum(1) + hist.sum(0) - np.diag(hist))
+        # IOU = TP / (FP + FN + TP)
         result = np.diag(hist) / (hist.sum(1) + hist.sum(0) - np.diag(hist))
         result[hist.sum(1) == 0] = float('nan')
         return result
@@ -112,9 +112,6 @@ class Metric_mIoU():
         new_hist, correct, labeled = self.hist_info(n_classes, pred.flatten(), label.flatten())
         hist += new_hist
         mIoUs = self.per_class_iu(hist)
-        # for ind_class in range(n_classes):
-        #     print(str(round(mIoUs[ind_class] * 100, 2)))
-        # print('===> mIoU: ' + str(round(np.nanmean(mIoUs) * 100, 2)))
         return round(np.nanmean(mIoUs) * 100, 2), hist
 
     def add_batch(self,semantics_pred,semantics_gt,mask_lidar,mask_camera):
@@ -141,16 +138,9 @@ class Metric_mIoU():
         self.hist += _hist
 
     def count_miou(self):
-        mIoU = self.per_class_iu(self.hist)
-        # assert cnt == num_samples, 'some samples are not included in the miou calculation'
-        print(f'===> per class IoU of {self.cnt} samples:')
-        for ind_class in range(self.num_classes-1):
-            print(f'===> {self.class_names[ind_class]} - IoU = ' + str(round(mIoU[ind_class] * 100, 2)))
-
-        print(f'===> mIoU of {self.cnt} samples: ' + str(round(np.nanmean(mIoU[:self.num_classes-1]) * 100, 2)))
-        # print(f'===> sample-wise averaged mIoU of {cnt} samples: ' + str(round(np.nanmean(mIoU_avg), 2)))
-
-        return round(np.nanmean(mIoU[:self.num_classes-1]) * 100, 2)
+        mIoU_dict = self.per_class_iu(self.hist)
+        mIoU = round(np.nanmean(mIoU_dict[:self.num_classes-1]) * 100, 2)
+        return mIoU_dict, mIoU
 
 
 class Metric_FScore():
@@ -296,7 +286,7 @@ class Metric_mRecall():
         return (
             np.bincount(
                 p_cl * gt[k].astype(int) + pred[k].astype(int), minlength=n_cl * p_cl
-            ).reshape(n_cl, p_cl),   # 18, 2
+            ).reshape(n_cl, p_cl),   # 18 x 18
             correct,
             labeled,
         )

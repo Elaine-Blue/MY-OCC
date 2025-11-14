@@ -134,13 +134,14 @@ class NuScenesOccDataset(NuScenesDataset):
 
         return input_dict
     
-    def evaluate(self, occ_results, runner=None, show_dir=None, **eval_kwargs):
-        results_dict = {}
-        results_dict.update(
-            self.eval_miou(occ_results, runner=runner, show_dir=show_dir, **eval_kwargs))
-        results_dict.update(
-            self.eval_riou(occ_results, runner=runner, show_dir=show_dir, **eval_kwargs))
-        return results_dict
+    def evaluate(self, occ_results, save_dir, runner=None, show_dir=None, **eval_kwargs):
+        miou_res = self.eval_miou(occ_results, runner=runner, show_dir=show_dir, **eval_kwargs)
+        riou_res = self.eval_riou(occ_results, runner=runner, show_dir=show_dir, **eval_kwargs)
+        eval_res = miou_res + '\n' + riou_res
+        result_save_path = os.path.join(save_dir, 'occ_results.txt')
+        with open(result_save_path, 'w') as f:
+            f.write(str(eval_res))
+        return eval_res
 
     def eval_miou(self, occ_results, runner=None, show_dir=None, **eval_kwargs):
         occ_gts = []
@@ -163,7 +164,6 @@ class NuScenesOccDataset(NuScenesDataset):
             occ_labels = occ_infos['semantics']
             mask_lidar = occ_infos['mask_lidar'].astype(np.bool_)
             mask_camera = occ_infos['mask_camera'].astype(np.bool_)
-
             occ_pred, _ = sparse2dense(
                 result_dict['occ_loc'],
                 result_dict['sem_pred'],
@@ -172,8 +172,16 @@ class NuScenesOccDataset(NuScenesDataset):
             
             metric.add_batch(occ_pred, occ_labels, mask_lidar, mask_camera)
         
-        return {'mIoU': metric.count_miou()}
-    
+        mIoU_dict, mIoU = metric.count_miou()
+        result_str = f'===> per class IoU of {metric.cnt} samples:\n'
+        
+        for ind_class in range(metric.num_classes-1):
+            result_str += f'===> {metric.class_names[ind_class]} - IoU = ' + str(round(mIoU_dict[ind_class] * 100, 2)) + '\n'
+        
+        result_str += f'===> mIoU of {metric.cnt} samples: ' + str(round(np.nanmean(mIoU_dict[:metric.num_classes-1]) * 100, 2)) + '\n'
+        print(result_str)
+        return result_str
+        
     def eval_riou(self, occ_results, runner=None, show_dir=None, **eval_kwargs):
         occ_gts = []
         occ_preds = []

@@ -89,6 +89,14 @@ sudo apt-get install -y libturbojpeg
 pip install pyturbojpeg
 pip uninstall pillow
 pip install pillow-simd==9.0.0.post1
+pip install pyvirtualdisplay
+```
+
+Install mayavi for offscreen
+```
+pip install vtk==9.0.1
+pip install mayavi==4.7.3
+pip install opencv-python-headless==4.12.0.88
 ```
 
 Compile CUDA extensions:

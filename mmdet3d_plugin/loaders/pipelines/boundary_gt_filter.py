@@ -205,7 +205,7 @@ class BoundaryGTFilter:
         boundary_free_mask = self.compute_boundary_free_voxels(semantics, mask_camera)
         
         # Identify all free voxels in original semantics
-        all_free_mask = (semantics == self.empty_label) & mask_camera.astype(bool)
+        all_free_mask = (semantics == self.empty_label).astype(bool)
 
         # Interior free voxels = all free voxels - boundary free voxels
         interior_free_mask = all_free_mask & (~boundary_free_mask.astype(bool))

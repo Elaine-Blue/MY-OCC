@@ -20,8 +20,8 @@ from mmdet3d.models import build_model
 from mmdet3d_plugin.models.utils import VERSION
 
 
-def evaluate(dataset, results):
-    metrics = dataset.evaluate(results, jsonfile_prefix='submission')
+def evaluate(dataset, results, save_dir):
+    metrics = dataset.evaluate(results, save_dir, jsonfile_prefix='submission')
     return metrics
 
 def main():
@@ -109,8 +109,9 @@ def main():
         results = single_gpu_test(model, val_loader)
 
     if local_rank == 0:
-        evaluate(val_dataset, results)
-
+        work_dir = '/'.join(args.weights.split('/')[:-1])
+        evaluate(val_dataset, results, work_dir)
+        
     if args.vis:
         work_dir = '/'.join(args.weights.split('/')[:-1])
         vis_dir = os.path.join(work_dir, 'val_visualization')

@@ -220,9 +220,4 @@ def main(sem_pred_list, sem_gt_list, lidar_origin_list):
 
     torch.cuda.empty_cache()
 
-    return {
-        'RayIoU': rayiou,
-        'RayIoU@1': rayiou_0,
-        'RayIoU@2': rayiou_1,
-        'RayIoU@4': rayiou_2,
-    }
+    return table.get_string()
