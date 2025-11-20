@@ -7,13 +7,14 @@ from .ssd_occ import SSDOCC
 from .ssd_occ_v1 import SSDOCCV1
 from .ssd_head import SSDOCCHead
 from .ssd_head_v1 import SSDOCCHeadV1
+from .ssd_head_v2 import SSDOCCHeadV2
 
 from .opus_pt import OPUS_PT
 from .opus_pt_head import OPUS_PT_Head
 from .opus_pt_transformer import OPUSTransformer_PT
-from .necks import RegionAwareHead, ObjectAwareHead, SSDTransformerDecoder
+from .necks import RegionAwareHead, ObjectAwareHead, SSDTransformerDecoder, BoundaryTransformerDecoder
 
 __all__ = ['MYOCC', 'MYOCCHead', 'OPUS_PT',
            'OPUS_PT_Head', 'OPUSTransformer_PT',
-           'SSDOCC', 'SSDOCCHead', 'SSDOCCV1', 'SSDOCCHeadV1',
-           'RegionAwareHead', 'ObjectAwareHead', 'SSDTransformerDecoder']
+           'SSDOCC', 'SSDOCCHead', 'SSDOCCV1', 'SSDOCCHeadV1', 'SSDOCCHeadV2',
+           'RegionAwareHead', 'ObjectAwareHead', 'SSDTransformerDecoder', 'BoundaryTransformerDecoder']

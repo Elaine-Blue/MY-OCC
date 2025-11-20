@@ -159,7 +159,7 @@ def main():
 
     if cfgs.resume_from is not None:
         logging.info('Resuming from %s' % cfgs.resume_from)
-        runner.resume(cfgs.resume_from)
+        runner.resume(cfgs.resume_from, map_location='cpu')
 
     elif cfgs.load_from is not None:
         logging.info('Loading checkpoint from %s' % cfgs.load_from)

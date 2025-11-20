@@ -11,7 +11,199 @@ from ..utils import inverse_sigmoid, DUMP
 from ..occ_sampling import sampling_4d
 from ..checkpoint import checkpoint as cp
 from ..csrc.wrapper import MSMV_CUDA
+from scipy.interpolate import RegularGridInterpolator
+import os, pickle
 
+
+class PositionEncoder(BaseModule):
+    """
+    Fourier Position Encoder with Occupancy Probability Weighting
+
+    For each point (x, y, z), computes:
+    1. Relative distance to scene center for each axis
+    2. Fourier encoding for each axis separately
+    3. Sum the three-axis encodings
+    4. Multiply by occupancy probability at that location
+    """
+    # Class-level cache for shared occupancy interpolator
+    _occ_interpolator_cache = {}
+
+    def __init__(self,
+                 embed_dims=256,
+                 grid_size=(200, 200, 16),  # meters
+                 occ_prior_path=None,
+                 pc_range=None,
+                 init_cfg=None):
+        super().__init__(init_cfg)
+        self.embed_dims = embed_dims
+        self.num_freqs = embed_dims // 2
+        self.grid_size = grid_size
+        self.scene_size = (pc_range[3] - pc_range[0],
+                           pc_range[4] - pc_range[1],
+                           pc_range[5] - pc_range[2])  # in meters
+        self.pc_range = pc_range
+        self.scene_center = torch.tensor([0.0, 0.0, 0.0])
+
+        '''
+            Fourier encoding:
+                for each axis, encode as [sin(2^0*pi*d), cos(2^0*pi*d), ..., sin(2^(L-1)*pi*d), cos(2^(L-1)*pi*d)]
+                total encoding dim per axis = 2 * num_freqs, total encoding dim = 3 * 2 * num_freqs
+        '''
+        self.fourier_dim = 2 * self.num_freqs
+
+        # Project Fourier encoding to embed_dims
+        self.pos_proj = nn.Sequential(
+            nn.Linear(self.fourier_dim, embed_dims),
+            nn.LayerNorm(embed_dims),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dims, embed_dims),
+            nn.LayerNorm(embed_dims),
+            nn.ReLU(inplace=True),
+        )
+
+        # Load or retrieve occupancy prior interpolator from cache
+        self.occ_interpolator = None
+        if occ_prior_path is not None and os.path.exists(occ_prior_path):
+            # Check if already loaded in cache
+            if occ_prior_path in PositionEncoder._occ_interpolator_cache:
+                self.occ_interpolator = PositionEncoder._occ_interpolator_cache[occ_prior_path]
+            else:
+                # Load and cache the interpolator
+                try:
+                    with open(occ_prior_path, 'rb') as f:
+                        occ_stats = pickle.load(f)
+                    occupancy_density = occ_stats['occupancy_density']
+
+                    # Create interpolator for occupancy probability
+                    X_dim, Y_dim, Z_dim = occupancy_density.shape
+                    self.occ_interpolator = RegularGridInterpolator(
+                        (np.arange(X_dim), np.arange(Y_dim), np.arange(Z_dim)),
+                        occupancy_density,
+                        method='linear',
+                        bounds_error=False,
+                        fill_value=0.5  # Default occupancy probability
+                    )
+                    # Cache for future instances
+                    PositionEncoder._occ_interpolator_cache[occ_prior_path] = self.occ_interpolator
+                    print(f"Loaded and cached occupancy prior from {occ_prior_path}")
+                except Exception as e:
+                    print(f"Warning: Failed to load occupancy prior: {e}")
+                    self.occ_interpolator = None
+
+        # Frequency bands for Fourier encoding
+        freq_bands = 2.0 * torch.linspace(0, self.num_freqs - 1, self.num_freqs)
+        self.register_buffer('freq_bands', freq_bands)
+
+    def get_rel_dist(self, points):
+        """
+        Calculate relative distance to scene center for each axis.
+
+        Args:
+            points: [B, Q, K, 3] in world coordinates
+
+        Returns:
+            relative_dist: [B, Q, K, 3] normalized to [-1, 1]
+        """
+        device = points.device
+        scene_center = self.scene_center.to(device)
+        dist_to_center = points - scene_center.view(1, 1, 1, 3)
+        scene_size = torch.tensor(self.scene_size, device=device).view(1, 1, 1, 3)
+        rel_dist = dist_to_center / (scene_size / 2.0)
+        # Clamp to [-1, 1]
+        rel_dist = torch.clamp(rel_dist, -1.0, 1.0)
+        return rel_dist
+
+    def fourier_encode(self, rel_dist):
+        """
+        Apply Fourier encoding to relative distances.
+
+        Args:
+            rel_dist: [B, Q, K, 3] normalized distances
+
+        Returns:
+            encoding: [B, Q, K, fourier_dim]
+        """
+        B, Q, K, _ = rel_dist.shape
+
+        # Split into x, y, z components
+        x_dist = rel_dist[..., 0:1]  # [B, Q, K, 1]
+        y_dist = rel_dist[..., 1:2]  # [B, Q, K, 1]
+        z_dist = rel_dist[..., 2:3]  # [B, Q, K, 1]
+
+        encodings = []
+
+        # Encode each axis separately
+        for dist in [x_dist, y_dist, z_dist]:
+            freq_dist = dist * self.freq_bands.view(1, 1, 1, -1) * np.pi  # [B, Q, K, num_freqs]
+
+            sin_encoding = torch.sin(freq_dist)  # [B, Q, K, num_freqs]
+            cos_encoding = torch.cos(freq_dist)  # [B, Q, K, num_freqs]
+
+            # Interleave sin and cos: [sin(f0), cos(f0), sin(f1), cos(f1), ...]
+            axis_encoding = torch.stack([sin_encoding, cos_encoding], dim=-1)  # [B, Q, K, num_freqs, 2]
+            axis_encoding = axis_encoding.reshape(B, Q, K, -1)  # [B, Q, K, 2*num_freqs]
+
+            encodings.append(axis_encoding)
+
+        fourier_encoding = encodings[0] + encodings[1] + encodings[2]
+        return fourier_encoding
+
+    def get_occ_prob(self, points):
+        """
+        Query occupancy probability at given points.
+
+        Args:
+            points: [B, Q, K, 3] in world coordinates
+
+        Returns:
+            occ_prob: [B, Q, K, 1]
+        """
+        if self.occ_interpolator is None:
+            return torch.ones_like(points[..., 0:1])
+
+        B, Q, K, _ = points.shape
+        device = points.device
+
+        if len(self.pc_range) >= 6:
+            # Map from world coords to grid coords [0, grid_dim)
+            x_min, y_min, z_min = self.pc_range[0], self.pc_range[1], self.pc_range[2]
+            x_max, y_max, z_max = self.pc_range[3], self.pc_range[4], self.pc_range[5]
+
+            # Normalize to [0, 1]
+            x_norm = (points[..., 0] - x_min) / (x_max - x_min)
+            y_norm = (points[..., 1] - y_min) / (y_max - y_min)
+            z_norm = (points[..., 2] - z_min) / (z_max - z_min)
+
+            grid_coords = torch.stack([
+                x_norm * (self.grid_size[0] - 1),
+                y_norm * (self.grid_size[1] - 1),
+                z_norm * (self.grid_size[2] - 1)
+            ], dim=-1)
+            
+            grid_coords_np = grid_coords.detach().cpu().numpy().reshape(-1, 3)
+            occ_probs_np = self.occ_interpolator(grid_coords_np)
+            occ_probs = torch.tensor(occ_probs_np, device=device, dtype=points.dtype)
+            occ_probs = occ_probs.reshape(B, Q, K, 1)
+        else:
+            occ_probs = torch.ones(B, Q, K, 1, device=device, dtype=points.dtype)
+
+        return occ_probs
+
+    def forward(self, query_points):
+        """
+        Args:
+            query_points: [B, Q, K, 3] in encoded/normalized coordinates
+
+        Returns:
+            pos_encoding: [B, Q, K, embed_dims]
+        """
+        points_ego = decode_points(query_points, self.pc_range)
+        rel_dist = self.get_rel_dist(points_ego)
+        fourier_features = self.fourier_encode(rel_dist)  # [B, Q, K, fourier_dim]
+        pos_encoding = self.pos_proj(fourier_features)  # [B, Q, K, embed_dims]
+        occ_prob = self.get_occ_prob(points_ego)  # [B, Q, K, 1]
+        pos_encoding = pos_encoding * occ_prob  # [B, Q, K, embed_dims]
+        return pos_encoding
 
 @TRANSFORMER.register_module()
 class OccTransformer(BaseModule):
@@ -27,7 +219,6 @@ class OccTransformer(BaseModule):
                  num_refines=[1, 2, 4, 8, 16, 32],
                  scales=[1.0],
                  pc_range=[],
-                 with_boundary_head=False,
                  init_cfg=None):
         assert init_cfg is None, 'To prevent abnormal initialization ' \
                             'behavior, init_cfg is not allowed to be set'
@@ -36,24 +227,23 @@ class OccTransformer(BaseModule):
         self.embed_dims = embed_dims
         self.pc_range = pc_range
         self.num_refines = num_refines
-        self.with_boundary_head = with_boundary_head
         
         self.decoder = TransformerDecoder(
             embed_dims, num_frames, num_views, num_points, num_layers, num_levels,
-            num_classes, num_refines, num_groups, scales, pc_range, with_boundary_head)
+            num_classes, num_refines, num_groups, scales, pc_range)
 
     @torch.no_grad()
     def init_weights(self):
         self.decoder.init_weights()
 
-    def forward(self, query_points, query_feat, mlvl_feats, img_metas, gt_bboxes_3d=None, gt_labels_3d=None):
-        cls_scores, refine_pts, boundary_scores = self.decoder(
-            query_points, query_feat, mlvl_feats, img_metas, gt_bboxes_3d, gt_labels_3d)
+    def forward(self, query_points, query_feat, mlvl_feats, img_metas):
+        cls_scores, refine_pts = self.decoder(
+            query_points, query_feat, mlvl_feats, img_metas)
 
         cls_scores = [torch.nan_to_num(score) for score in cls_scores]
         refine_pts = [torch.nan_to_num(pts) for pts in refine_pts]
 
-        return cls_scores, refine_pts, boundary_scores
+        return cls_scores, refine_pts
 
 
 class TransformerDecoder(BaseModule):
@@ -69,7 +259,6 @@ class TransformerDecoder(BaseModule):
                  num_groups=4,
                  scales=[1.0],
                  pc_range=[],
-                 with_boundary_head=False,
                  init_cfg=None):
         super().__init__(init_cfg)
         self.num_layers = num_layers
@@ -93,16 +282,15 @@ class TransformerDecoder(BaseModule):
                 TransformerDecoderLayer(
                     embed_dims, num_frames, num_views, num_points, num_levels, num_classes, 
                     num_groups, num_refines[i], last_refines[i], layer_idx=i, 
-                    scale=scales[i], pc_range=pc_range, with_boundary_head=with_boundary_head)
+                    scale=scales[i], pc_range=pc_range)
             )
-
+        
     @torch.no_grad()
     def init_weights(self):
         self.decoder_layers.init_weights()
 
-    def forward(self, query_points, query_feat, mlvl_feats, img_metas, gt_bboxes_3d=None, gt_labels_3d=None):
-        cls_scores, refine_pts, boundary_scores = [], [], []
-
+    def forward(self, query_points, query_feat, mlvl_feats, img_metas):
+        cls_scores, refine_pts = [], []
         ego2img = np.asarray([m['ego2img'] for m in img_metas]).astype(np.float32)
         ego2img = query_feat.new_tensor(ego2img) # [B, N, 4, 4]
         ego2occ = np.asarray([m['ego2occ'] for m in img_metas]).astype(np.float32)
@@ -130,14 +318,13 @@ class TransformerDecoder(BaseModule):
             DUMP.stage_count = i
 
             query_points = query_points.detach()
-            query_feat, cls_score, query_points, boundary_score = decoder_layer(
-                query_points, query_feat, mlvl_feats, occ2img, img_metas, gt_bboxes_3d, gt_labels_3d)
+            query_feat, cls_score, query_points = decoder_layer(
+                query_points, query_feat, mlvl_feats, occ2img, img_metas)
 
             cls_scores.append(cls_score)
             refine_pts.append(query_points)
-            boundary_scores.append(boundary_score)
 
-        return cls_scores, refine_pts, boundary_scores
+        return cls_scores, refine_pts
 
 class TransformerDecoderLayer(BaseModule):
     def __init__(self,
@@ -152,11 +339,10 @@ class TransformerDecoderLayer(BaseModule):
                  last_refines=16,
                  num_cls_fcs=2,
                  num_reg_fcs=2,
-                 num_boundary_fcs=2,
                  layer_idx=0,
                  scale=1.0,
                  pc_range=[],
-                 with_boundary_head=False,
+                 occ_prior_path='data/nuscenes/occupancy_prior.pkl',
                  init_cfg=None):
         super().__init__(init_cfg)
 
@@ -168,18 +354,16 @@ class TransformerDecoderLayer(BaseModule):
         self.last_refines = last_refines
         self.layer_idx = layer_idx
         self.scale = scale
-        self.with_boundary_head = with_boundary_head
-        
-        self.position_encoder = nn.Sequential(
-            nn.Linear(3 * self.last_refines, self.embed_dims), 
-            nn.LayerNorm(self.embed_dims),
-            nn.ReLU(inplace=True),
-            nn.Linear(self.embed_dims, self.embed_dims),
-            nn.LayerNorm(self.embed_dims),
-            nn.ReLU(inplace=True),
+
+        # Use new Fourier-based position encoder with occupancy prior
+        self.position_encoder = PositionEncoder(
+            embed_dims=embed_dims,
+            grid_size=(200, 200, 16),
+            occ_prior_path=occ_prior_path,
+            pc_range=pc_range
         )
 
-        self.self_attn = SSDAttention(
+        self.self_attn = SelfAttention(
             embed_dims, num_heads=8, dropout=0.1, pc_range=pc_range)
         self.sampling = Sampling(embed_dims, num_frames=num_frames, num_views=num_views,
                                  num_groups=num_groups, num_points=num_points,
@@ -208,16 +392,6 @@ class TransformerDecoderLayer(BaseModule):
         reg_branch.append(nn.Linear(self.embed_dims, 3 * self.num_refines))
         self.reg_branch = nn.Sequential(*reg_branch)
 
-        if with_boundary_head:
-            boundary_branch = []
-            for _ in range(num_boundary_fcs):
-                boundary_branch.append(nn.Linear(self.embed_dims, self.embed_dims))
-                boundary_branch.append(nn.LayerNorm(self.embed_dims))
-                boundary_branch.append(nn.ReLU(inplace=True))
-            boundary_branch.append(nn.Linear(
-                self.embed_dims, 2 * self.num_refines))
-            self.boundary_branch = nn.Sequential(*boundary_branch)
-
     @torch.no_grad()
     def init_weights(self):
         self.self_attn.init_weights()
@@ -226,9 +400,7 @@ class TransformerDecoderLayer(BaseModule):
 
         bias_init = bias_init_with_prob(0.01)
         nn.init.constant_(self.cls_branch[-1].bias, bias_init)
-        if self.with_boundary_head:
-            nn.init.constant_(self.boundary_branch[-1].bias, bias_init)
-        
+
     def refine_points(self, points_proposal, points_delta):
         B, Q = points_delta.shape[:2]
         points_delta = points_delta.reshape(B, Q, self.num_refines, 3)
@@ -238,17 +410,22 @@ class TransformerDecoderLayer(BaseModule):
         new_points = points_proposal + points_delta
         return encode_points(new_points, self.pc_range)
 
-    def forward(self, query_points, query_feat, mlvl_feats, occ2img, img_metas, gt_bboxes_3d=None, gt_labels_3d=None):
+    def forward(self, query_points, query_feat, mlvl_feats, occ2img, img_metas):
         """
-        query_points: [B, Q, 3] [x, y, z]
+        query_points: [B, Q, K, 3] [x, y, z]
         """
-        query_pos = self.position_encoder(query_points.flatten(2, 3))
+        # Use new position encoder that outputs [B, Q, K, embed_dims]
+        query_pos = self.position_encoder(query_points)  # [B, Q, K, embed_dims]
+
+        # Average over K dimension to get [B, Q, embed_dims]
+        query_pos = query_pos.mean(dim=2)  # [B, Q, embed_dims]
+
         query_feat = query_feat + query_pos
 
         sampled_feat = self.sampling(
             query_points, query_feat, mlvl_feats, occ2img, img_metas)
         query_feat = self.norm1(self.mixing(sampled_feat, query_feat))
-        query_feat = self.norm2(self.self_attn(query_points, query_feat, gt_bboxes_3d, gt_labels_3d))
+        query_feat = self.norm2(self.self_attn(query_points, query_feat))
         query_feat = self.norm3(self.ffn(query_feat))
 
         B, Q = query_points.shape[:2]
@@ -256,31 +433,23 @@ class TransformerDecoderLayer(BaseModule):
         reg_offset = self.scale * self.reg_branch(query_feat)  # [B, Q, P * 3]
         cls_score = cls_score.reshape(B, Q, self.num_refines, self.num_classes)
         refine_pt = self.refine_points(query_points, reg_offset)
-        
-        if self.with_boundary_head:
-            boundary_score = self.boundary_branch(query_feat)  # [B, Q, P * 2]
-            boundary_score = boundary_score.reshape(B, Q, self.num_refines, 2)
-        else:
-            boundary_score = None
-        
+
         if DUMP.enabled:
             pass # TODO: enable OTR dump
 
-        return query_feat, cls_score, refine_pt, boundary_score
+        return query_feat, cls_score, refine_pt
 
 
 class SelfAttention(BaseModule):
     """Scale-adaptive Self Attention"""
     def __init__(self, 
-                 embed_dims=256,      # 嵌入维度，默认值为256
-                 num_heads=8,         # 注意力头的数量，默认值为8
-                 dropout=0.1,         # dropout概率，默认值为0.1
-                 pc_range=[],         # 点云范围，默认为空列表
-                 init_cfg=None):      # 初始化配置，默认为None
-        super().__init__(init_cfg)  # 调用父类的初始化方法
-        self.pc_range = pc_range    # 保存点云范围属性
-
-        # 创建多头注意力机制，参数包括嵌入维度、注意力头数、dropout概率和batch_first参数
+                 embed_dims=256,
+                 num_heads=8,
+                 dropout=0.1,
+                 pc_range=[],
+                 init_cfg=None):
+        super().__init__(init_cfg)
+        self.pc_range = pc_range
         self.attention = MultiheadAttention(embed_dims, num_heads, dropout, batch_first=True)
         self.gen_tau = nn.Linear(embed_dims, num_heads)
 
@@ -582,15 +751,30 @@ class AdaptiveMixing(nn.Module):
         nn.init.zeros_(self.parameter_generator.weight)
 
     def inner_forward(self, x, query):
-        B, Q, G, P, C = x.shape
+        B, Q, G, T, P, C = x.shape
         assert G == self.n_groups
-        assert P == self.in_points
+        assert T * P == self.in_points
         assert C == self.eff_in_dim
+        
+        '''generate temporal consistency parameters'''
+        x_reshaped = x.reshape(B*Q, T, G*P, C)  # [B*Q, T, P*G, C]
+
+        # Compute mean feature per frame for each query-group combination
+        frame_features = x_reshaped.mean(dim=2)  # [B*Q, T, C]
+
+        # Compute pairwise cosine similarity between frames
+        frame_features_norm = F.normalize(frame_features, p=2, dim=-1)  # [B*Q, T, C]
+        similarity_matrix = torch.matmul(frame_features_norm, frame_features_norm.transpose(1, 2))  # [B*Q, T, T]
+        temporal_weights = F.softmax(similarity_matrix, dim=-1)[..., -1].reshape(B*Q, T, 1, 1)  # [B*Q, T, 1, 1]
+
+        # Aggregate features across frames based on semantic similarity
+        x_reshaped_weighted = temporal_weights.repeat(1, 1, G*P, 1) * x_reshaped  # [B*Q, T, G*P, C]
+        x = x_reshaped_weighted.reshape(B, Q, G, T*P, C)
 
         '''generate mixing parameters'''
         params = self.parameter_generator(query)
         params = params.reshape(B*Q, G, -1)
-        out = x.reshape(B*Q, G, P, C)
+        out = x.reshape(B*Q, G, T*P, C)
 
         M, S = params.split([self.m_parameters, self.s_parameters], 2)
         M = M.reshape(B*Q, G, self.eff_in_dim, self.eff_out_dim)
@@ -618,3 +802,226 @@ class AdaptiveMixing(nn.Module):
             return cp(self.inner_forward, x, query, use_reentrant=False)
         else:
             return self.inner_forward(x, query)
+
+class PositionEncoderV0(nn.Module):
+    """
+    Position encoder enhanced with learned occupancy priors.
+
+    Integrates:
+    1. Fourier positional encoding for multi-scale spatial patterns
+    2. Pre-computed occupancy probability distribution from training data
+    3. Spatial entropy (uncertainty) information
+    """
+    def __init__(self,
+                 embed_dims,
+                 prior_path=None,
+                 num_freq_bands=8,
+                 grid_shape=(200, 200, 16),
+                 pc_range=[],
+                 use_trilinear=True):
+        """
+        Args:
+            embed_dims: Embedding dimension
+            prior_path: Path to pre-computed occupancy statistics (.pkl)
+            num_freq_bands: Number of Fourier frequency bands
+            grid_shape: Voxel grid dimensions (X, Y, Z)
+            pc_range: Point cloud range [x_min, y_min, z_min, x_max, y_max, z_max]
+            use_trilinear: Use trilinear interpolation for smooth lookup
+        """
+        super().__init__()
+        self.embed_dims = embed_dims
+        self.grid_shape = grid_shape
+        self.pc_range = torch.tensor(pc_range).reshape(2, 3) if len(pc_range) > 0 else None
+        self.use_trilinear = use_trilinear
+        self.num_freq_bands = num_freq_bands
+
+        if prior_path is not None and os.path.exists(prior_path):
+            with open(prior_path, 'rb') as f:
+                stats = pickle.load(f)
+
+            self.register_buffer(
+                'occupancy_density', torch.from_numpy(stats['occupancy_density']).float())
+
+            self.register_buffer(
+                'entropy', torch.from_numpy(stats['entropy']).float())
+        else:
+            # Initialize with uniform priors if not available
+            self.register_buffer(
+                'occupancy_density', torch.ones(grid_shape) * 0.5
+            )
+            self.register_buffer(
+                'entropy', torch.ones(grid_shape) * 0.0
+            )
+        # Learnable frequency bands for Fourier encoding
+        self.freq_bands = nn.Parameter(
+            torch.linspace(0, num_freq_bands - 1, num_freq_bands)
+        )
+
+        # Fourier feature projection
+        self.fourier_proj = nn.Sequential(
+            nn.Linear(3 * num_freq_bands * 2, embed_dims // 3),
+            nn.LayerNorm(embed_dims // 3),
+            nn.ReLU(inplace=True),
+        )
+
+        # Prior feature encoder (density + entropy)
+        self.prior_encoder = nn.Sequential(
+            nn.Linear(2, embed_dims // 3),
+            nn.LayerNorm(embed_dims // 3),
+            nn.ReLU(inplace=True),
+        )
+
+        # Absolute position encoder
+        self.abs_pos_encoder = nn.Sequential(
+            nn.Linear(3, embed_dims // 3),
+            nn.LayerNorm(embed_dims // 3),
+            nn.ReLU(inplace=True),
+        )
+
+        # Fusion module
+        self.fusion = nn.Sequential(
+            nn.Linear(embed_dims, embed_dims),
+            nn.LayerNorm(embed_dims),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dims, embed_dims),
+            nn.LayerNorm(embed_dims),
+            nn.ReLU(inplace=True),
+        )
+
+    def sample_prior_features(self, positions):
+        """
+        Sample occupancy prior features at given positions.
+
+        Args:
+            positions: (N, 3) normalized positions in [0, 1]
+
+        Returns:
+            density: (N,) occupancy density at each position
+            entropy: (N,) spatial entropy at each position
+        """
+        N = positions.shape[0]
+        device = positions.device
+
+        # Convert normalized positions to grid indices
+        # positions are in range [0, 1] for each dimension
+        grid_indices = positions * torch.tensor(
+            self.grid_shape, device=device, dtype=positions.dtype
+        ).view(1, 3)
+
+        if self.use_trilinear:
+            # Trilinear interpolation for smooth lookup
+            density = self._trilinear_sample(
+                self.occupancy_density, grid_indices
+            )
+            entropy = self._trilinear_sample(
+                self.entropy, grid_indices
+            )
+        else:
+            # Nearest neighbor lookup
+            grid_indices = torch.clamp(
+                grid_indices.long(),
+                min=torch.zeros(3, device=device).long(),
+                max=torch.tensor(self.grid_shape, device=device).long() - 1
+            )
+
+            density = self.occupancy_density[
+                grid_indices[:, 0],
+                grid_indices[:, 1],
+                grid_indices[:, 2]
+            ]
+
+            entropy = self.entropy[
+                grid_indices[:, 0],
+                grid_indices[:, 1],
+                grid_indices[:, 2]
+            ]
+
+        return density, entropy
+
+    def _trilinear_sample(self, grid, positions):
+        """
+        Trilinear interpolation for 3D grid sampling.
+
+        Args:
+            grid: (X, Y, Z) 3D grid
+            positions: (N, 3) continuous positions in grid coordinates
+
+        Returns:
+            values: (N,) interpolated values
+        """
+        device = positions.device
+
+        # Get integer and fractional parts
+        positions_floor = torch.floor(positions).long()
+        positions_frac = positions - positions_floor.float()
+
+        # Clamp to valid range
+        X, Y, Z = self.grid_shape
+        positions_floor = torch.clamp(
+            positions_floor,
+            min=torch.zeros(3, device=device).long(),
+            max=torch.tensor([X-2, Y-2, Z-2], device=device).long()
+        )
+
+        # Get 8 corner points
+        x0, y0, z0 = positions_floor[:, 0], positions_floor[:, 1], positions_floor[:, 2]
+        x1, y1, z1 = x0 + 1, y0 + 1, z0 + 1
+
+        # Get fractional distances
+        xd, yd, zd = positions_frac[:, 0], positions_frac[:, 1], positions_frac[:, 2]
+
+        # Sample 8 corners
+        c000 = grid[x0, y0, z0]
+        c001 = grid[x0, y0, z1]
+        c010 = grid[x0, y1, z0]
+        c011 = grid[x0, y1, z1]
+        c100 = grid[x1, y0, z0]
+        c101 = grid[x1, y0, z1]
+        c110 = grid[x1, y1, z0]
+        c111 = grid[x1, y1, z1]
+
+        # Trilinear interpolation
+        c00 = c000 * (1 - xd) + c100 * xd
+        c01 = c001 * (1 - xd) + c101 * xd
+        c10 = c010 * (1 - xd) + c110 * xd
+        c11 = c011 * (1 - xd) + c111 * xd
+
+        c0 = c00 * (1 - yd) + c10 * yd
+        c1 = c01 * (1 - yd) + c11 * yd
+
+        c = c0 * (1 - zd) + c1 * zd
+
+        return c
+
+    def forward(self, query_points):
+        """
+        Args:
+            query_points: (B, Q, K, 3) normalized positions in [0, 1]
+
+        Returns:
+            pos_encoding: (B, Q, K, embed_dims) position encodings
+        """
+        # 1. Fourier encoding
+        freq = self.freq_bands.view(1, 1, -1)
+        pos = query_points.unsqueeze(-1)
+        angle = 2 * torch.pi * pos * torch.exp2(freq)
+        fourier_feats = torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1)
+        fourier_feats = fourier_feats.flatten(-2)
+        fourier_encoded = self.fourier_proj(fourier_feats)
+
+        # 2. Sample occupancy priors
+        density, entropy = self.sample_prior_features(positions)
+        prior_feats = torch.stack([density, entropy], dim=-1)  # (N, 2)
+        prior_encoded = self.prior_encoder(prior_feats)
+
+        # 3. Absolute position encoding
+        abs_pos_encoded = self.abs_pos_encoder(positions)
+
+        # 4. Fuse all features
+        combined = torch.cat([
+            fourier_encoded,
+            prior_encoded,
+            abs_pos_encoded
+        ], dim=-1)
+
+        return self.fusion(combined)

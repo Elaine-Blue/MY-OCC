@@ -111,7 +111,7 @@ def sampling_4d(sample_points, mlvl_feats, scale_weights, occ2img, image_h, imag
     scale_weights = scale_weights.permute(0, 2, 3, 1, 4, 5)
     scale_weights = scale_weights.reshape(B*G*T, Q, P, -1)
     scale_weights = scale_weights.contiguous()
-
+    
     # multi-scale multi-view grid sample
     final = msmv_sampling(mlvl_feats, sample_points_cam, scale_weights)
 
@@ -119,6 +119,6 @@ def sampling_4d(sample_points, mlvl_feats, scale_weights, occ2img, image_h, imag
     C = final.shape[2]  # [BTG, Q, C, P]
     final = final.reshape(B, T, G, Q, C, P)
     final = final.permute(0, 3, 2, 1, 5, 4)
-    final = final.flatten(3, 4)  # [B, Q, G, FP, C]
+    # final = final.flatten(3, 4)
 
-    return final
+    return final # [B, Q, G, T, P, C]

@@ -161,7 +161,8 @@ class SSDOCC(MVXTwoStageDetector):
                       img_depth=None,
                       img_mask=None,
                       voxel_semantics=None,
-                      mask_camera=None):
+                      mask_camera=None,
+                      boundary_distance=None):
         """Forward training function.
         Args:
             points (list[torch.Tensor], optional): Points of each sample.
@@ -191,13 +192,15 @@ class SSDOCC(MVXTwoStageDetector):
         losses = self.pts_bbox_head.loss(*loss_inputs)
 
         # TODO: Record model output
+        filter_result = self.pts_bbox_head.get_occ(outs, img_metas[0])
         self.intermediate_results.update(
             dict(
                 imgs=img.clone(),
-                result_list=copy.copy(outs),
+                result_list=copy.copy(filter_result),
             )
         )
-        self.intermediate_results['matched_results'] = self.pts_bbox_head.matched_results
+        if hasattr(self.pts_bbox_head, 'matched_results'):
+            self.intermediate_results['matched_results'] = self.pts_bbox_head.matched_results
         return losses
 
     def forward_test(self, img_metas, img=None, **kwargs):

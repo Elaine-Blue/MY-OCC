@@ -14,7 +14,6 @@ Notes:
         `from mayaviOffScreen import mlab` appears before `import otherModule`!
         So that `mayaviOffScreen.mlab` covers `otherModule.mlab`.
 """
-
 from pyvirtualdisplay import Display
 
 display = Display(visible=False, size=(1280, 1024))

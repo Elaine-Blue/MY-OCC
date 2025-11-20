@@ -59,7 +59,7 @@ def visualize_results(pc_range, voxel_size, results, matched_results, data_batch
 
         for camera_name, img_path in zip(camera_names, img_paths_fix):
             img = cv2.imread(img_path)
-            img = cv2.resize(img, vis_tool.RESIZE_SAHPE)
+            img = cv2.resize(img, vis_tool.RESIZE_SHAPE)
             cv2.putText(img, camera_name, (0, 20), cv2.FONT_HERSHEY_SIMPLEX,
                         0.6, (255, 255, 255), 2)
             resize_imgs.append(img)
@@ -86,7 +86,7 @@ def visualize_results(pc_range, voxel_size, results, matched_results, data_batch
         )
         
         # 3. Visualize Pred Labels
-        label, pos = results['sem_pred'][i].reshape(-1,), results['occ_loc'][i].reshape(-1, 3)
+        label, pos = results[i]['sem_pred'].reshape(-1,), results[i]['occ_loc'].reshape(-1, 3)
         x = xx[pos[:, 0], pos[:, 1], pos[:, 2]]
         y = yy[pos[:, 0], pos[:, 1], pos[:, 2]]
         z = zz[pos[:, 0], pos[:, 1], pos[:, 2]]
@@ -137,10 +137,12 @@ class VisualizationHook(Hook):
     
     def __init__(self, interval=1000):
         self.interval = interval
-    
+        self.counter = 0
+        
     def after_train_iter(self, runner):
         """Visualize results after each training iteration."""
         if self.every_n_iters(runner, self.interval):
+            self.counter += 1
             model = runner.model.module
             result_list = model.intermediate_results['result_list']
             
@@ -151,7 +153,7 @@ class VisualizationHook(Hook):
             pc_range = model.pts_bbox_head.pc_range.cpu().numpy()
             voxel_size = model.pts_bbox_head.voxel_size.cpu().numpy()
             
-            result_list = post_process(result_list, pc_range, voxel_size)
+            # result_list = post_process(result_list, pc_range, voxel_size)
             
             data_batch = runner.data_batch
             epoch = runner.epoch
@@ -166,6 +168,6 @@ class VisualizationHook(Hook):
                 data_batch,
                 save_dir,
                 epoch,
-                self.interval
+                self.counter * self.interval
             )
 
